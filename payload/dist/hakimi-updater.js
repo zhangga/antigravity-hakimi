@@ -54,10 +54,20 @@ function resolveCurrentBundlePath(options = {}) {
   }
   const execPath = options.execPath || process.execPath || '';
   if (execPath) {
-    const m = path.resolve(execPath).match(/^(.+?\.app)\/Contents\/MacOS\/[^/]+$/);
+    const resolvedExec = path.resolve(execPath);
+    const m = resolvedExec.replace(/\\/g, '/').match(/^(.+?\.app)\/Contents\/MacOS\/[^/]+$/);
     if (m && m[1]) {
       if (!asarEngine.isOfficialAntigravityPath(m[1]) || options.allowOfficialForTest) {
         return m[1];
+      }
+    }
+    if (process.platform === 'win32' && resolvedExec.toLowerCase().endsWith('.exe')) {
+      const dir = path.dirname(resolvedExec);
+      if (
+        fs.existsSync(path.join(dir, 'resources', 'app.asar')) &&
+        (!asarEngine.isOfficialAntigravityPath(dir) || options.allowOfficialForTest)
+      ) {
+        return dir;
       }
     }
   }

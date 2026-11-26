@@ -37,6 +37,8 @@ const {
   isOfficialAntigravityBundle,
   shellEscapeForSecurity,
   createMacOsKeychainAdapter,
+  createWindowsKeychainAdapter,
+  createPlatformKeychainAdapter,
   computeTokenFingerprint,
   normalizeEmail,
   sanitizeProfileId,
@@ -79,7 +81,7 @@ function resolveKeychain(options = {}) {
   if (options.keychain && typeof options.keychain.get === 'function') {
     return options.keychain;
   }
-  return createMacOsKeychainAdapter(options.execFileSync || execFileSync);
+  return createPlatformKeychainAdapter(options);
 }
 
 function ensureSupported(options = {}) {
@@ -88,7 +90,7 @@ function ensureSupported(options = {}) {
     return {
       ok: false,
       supported: false,
-      error: '账号快捷切换目前仅支持 macOS 系统钥匙串',
+      error: '账号快捷切换目前仅支持 macOS 系统钥匙串与 Windows 凭据管理器',
       profiles: [],
     };
   }
@@ -110,15 +112,26 @@ function resolveTargetAppBundlePath(options = {}) {
     }
     return p;
   }
-  // If running inside packaged 哈基米.app Electron main process:
-  // <bundle>/Contents/MacOS/Antigravity -> <bundle>
+  // If running inside packaged Hakimi Electron main process:
+  // macOS: <bundle>.app/Contents/MacOS/Antigravity -> <bundle>.app
+  // Windows: <appDir>\Antigravity.exe -> <appDir>
   const execPath = options.execPath || process.execPath || '';
   if (execPath) {
-    const macMatch = path.resolve(execPath).match(/^(.+?\.app)\/Contents\/MacOS\/[^/]+$/);
+    const resolvedExec = path.resolve(execPath);
+    const macMatch = resolvedExec.replace(/\\/g, '/').match(/^(.+?\.app)\/Contents\/MacOS\/[^/]+$/);
     if (macMatch && macMatch[1]) {
       const detected = macMatch[1];
       if (!isOfficialAntigravityBundle(detected) || options.allowOfficialForTest) {
         return detected;
+      }
+    }
+    if ((options.platform || process.platform) === 'win32' && resolvedExec.toLowerCase().endsWith('.exe')) {
+      const dir = path.dirname(resolvedExec);
+      if (
+        fs.existsSync(path.join(dir, 'resources', 'app.asar')) &&
+        (!isOfficialAntigravityBundle(dir) || options.allowOfficialForTest)
+      ) {
+        return dir;
       }
     }
   }
@@ -133,10 +146,17 @@ function resolveNodeRuntime(options = {}) {
   if (options.nodeBin) {
     return { bin: String(options.nodeBin), envExtra: {} };
   }
-  const candidates = ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
+  const plat = options.platform || process.platform;
   const pathEnv = String(process.env.PATH || '');
+  const candidates = plat === 'win32'
+    ? []
+    : ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
+  const nodeName = plat === 'win32' ? 'node.exe' : 'node';
   for (const dir of pathEnv.split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, 'node'));
+    if (dir) candidates.push(path.join(dir, nodeName));
+  }
+  if (plat === 'win32' && process.env.ProgramFiles) {
+    candidates.push(path.join(process.env.ProgramFiles, 'nodejs', 'node.exe'));
   }
   for (const candidate of candidates) {
     try {
@@ -231,13 +251,25 @@ function getAccountsStatus(options = {}) {
     }
   }
 
-  // 2. Metadata-only Vault existence check (NO `-w` plaintext reads for saved profiles!)
+  // 2. Metadata-only Vault existence check (NO plaintext reads for saved profiles!)
+  let vaultMap = null;
+  if (typeof kc.hasMany === 'function' && registry.profiles.length > 0) {
+    try {
+      vaultMap = kc.hasMany(VAULT_KEYCHAIN_SERVICE, registry.profiles.map((p) => p.id));
+    } catch {
+      vaultMap = null;
+    }
+  }
   const profiles = registry.profiles.map((p) => {
     let vaultPresent = false;
-    try {
-      vaultPresent = keychainHas(kc, VAULT_KEYCHAIN_SERVICE, p.id);
-    } catch {
-      vaultPresent = false;
+    if (vaultMap && Object.prototype.hasOwnProperty.call(vaultMap, p.id)) {
+      vaultPresent = Boolean(vaultMap[p.id]);
+    } else {
+      try {
+        vaultPresent = keychainHas(kc, VAULT_KEYCHAIN_SERVICE, p.id);
+      } catch {
+        vaultPresent = false;
+      }
     }
     const isActive = Boolean(activeProfile && activeProfile.id === p.id);
     return {
@@ -379,6 +411,7 @@ function stageAndSpawnColdHelper(job, options = {}) {
   try {
     const child = spawnImpl(runtime.bin, [stagedHelperPath, '--job', jobFilePath], {
       detached: true,
+      windowsHide: true,
       stdio: ['ignore', logFd, logFd],
       env: { ...process.env, ...runtime.envExtra },
     });
@@ -608,6 +641,8 @@ module.exports = {
   isSupportedPlatform,
   shellEscapeForSecurity,
   createMacOsKeychainAdapter,
+  createWindowsKeychainAdapter,
+  createPlatformKeychainAdapter,
   computeTokenFingerprint,
   extractEmailHintFromSecret,
   extractTierHintFromSecret,

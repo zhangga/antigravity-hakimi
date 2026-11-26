@@ -21,6 +21,7 @@ const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 
 const OFFICIAL_BUNDLE_NAMES = new Set(['antigravity.app', 'antigravity.app.orig']);
+const OFFICIAL_WIN_DIR_NAMES = new Set(['antigravity', 'antigravity.orig']);
 const UPGRADE_HELPER_FILE_NAME = 'hakimi-upgrade-helper.js';
 const UPGRADE_LOCK_FILE_NAME = 'hakimi-upgrade-cold.lock';
 const UPGRADE_RESULT_FILE_NAME = 'hakimi-upgrade-last-result.json';
@@ -79,18 +80,36 @@ function resolveWithExistingAncestor(targetPath) {
 }
 
 function matchesOfficialBundlePath(candidatePath) {
-  const normalized = path.resolve(String(candidatePath || '')).replace(/\/+$/, '').toLowerCase();
-  if (
-    normalized === '/applications/antigravity.app' ||
-    normalized.startsWith('/applications/antigravity.app/') ||
-    normalized === '/applications/antigravity.app.orig' ||
-    normalized.startsWith('/applications/antigravity.app.orig/')
-  ) {
-    return true;
+  const rawPosix = String(candidatePath || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const resolvedPosix = path.resolve(String(candidatePath || '')).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const forms = new Set([rawPosix, resolvedPosix]);
+  for (const f of [...forms]) {
+    const withoutDrive = f.replace(/^[a-z]:(?=\/)/, '');
+    if (withoutDrive !== f) forms.add(withoutDrive);
   }
-  const parts = normalized.split('/').filter(Boolean);
-  for (const part of parts) {
-    if (OFFICIAL_BUNDLE_NAMES.has(part)) return true;
+  for (const normalized of forms) {
+    if (
+      normalized === '/applications/antigravity.app' ||
+      normalized.startsWith('/applications/antigravity.app/') ||
+      normalized === '/applications/antigravity.app.orig' ||
+      normalized.startsWith('/applications/antigravity.app.orig/')
+    ) {
+      return true;
+    }
+    const parts = normalized.split('/').filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (OFFICIAL_BUNDLE_NAMES.has(part)) return true;
+      if (
+        OFFICIAL_WIN_DIR_NAMES.has(part) &&
+        i > 0 &&
+        (parts[i - 1] === 'programs' ||
+          parts[i - 1] === 'program files' ||
+          parts[i - 1] === 'program files (x86)')
+      ) {
+        return true;
+      }
+    }
   }
   return false;
 }

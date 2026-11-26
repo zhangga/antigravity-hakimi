@@ -10,8 +10,11 @@
     "pretest": "node scripts/build-renderer.js",
     "test": "node --test test/*.test.js",
     "build:hakimi": "bash ./build-hakimi.sh",
+    "build:win": "node scripts/build-renderer.js && node scripts/build-hakimi-win.js",
+    "build:win:stage": "node scripts/build-renderer.js && node scripts/build-hakimi-win.js --stage-only",
     "set-icon": "bash ./set-hakimi-icon.sh",
     "unlock:cli": "node scripts/cli-unlock.js --apply",
+    "accounts": "node scripts/account-switch.js",
     "doctor": "node scripts/doctor.js"
   },
   "keywords": [

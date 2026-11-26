@@ -6,7 +6,39 @@ const os = require('os');
 const crypto = require('crypto');
 
 const OFFICIAL_ANTIGRAVITY_NAMES = new Set(['antigravity.app', 'antigravity.app.orig']);
-const DEFAULT_HAKIMI_APP = '/Applications/哈基米.app';
+const OFFICIAL_WIN_DIR_NAMES = new Set(['antigravity', 'antigravity.orig']);
+
+function getDefaultHakimiAppPath(platform = process.platform, env = process.env, homeDir = os.homedir()) {
+  if (platform === 'darwin') return '/Applications/哈基米.app';
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+    return path.join(localAppData, 'Programs', 'Hakimi');
+  }
+  return path.join(homeDir, '.local', 'share', 'Hakimi');
+}
+
+function getDefaultOfficialAppPath(platform = process.platform, env = process.env, homeDir = os.homedir()) {
+  if (platform === 'darwin') {
+    return fs.existsSync('/Applications/Antigravity.app.orig')
+      ? '/Applications/Antigravity.app.orig'
+      : '/Applications/Antigravity.app';
+  }
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+    const candidates = [
+      path.join(localAppData, 'Programs', 'Antigravity'),
+      env.ProgramFiles ? path.join(env.ProgramFiles, 'Antigravity') : null,
+      env['ProgramFiles(x86)'] ? path.join(env['ProgramFiles(x86)'], 'Antigravity') : null,
+    ].filter(Boolean);
+    for (const cand of candidates) {
+      if (fs.existsSync(cand)) return cand;
+    }
+    return candidates[0] || path.join(localAppData, 'Programs', 'Antigravity');
+  }
+  return '/opt/Antigravity';
+}
+
+const DEFAULT_HAKIMI_APP = getDefaultHakimiAppPath();
 
 function withNoAsar(fn) {
   const prev = process.noAsar;
@@ -36,19 +68,71 @@ function resolveWithExistingAncestor(targetPath) {
   }
 }
 
-function matchesOfficialBundlePath(candidatePath) {
-  const normalized = path.resolve(String(candidatePath || '')).replace(/\/+$/, '').toLowerCase();
-  if (
-    normalized === '/applications/antigravity.app' ||
-    normalized.startsWith('/applications/antigravity.app/') ||
-    normalized === '/applications/antigravity.app.orig' ||
-    normalized.startsWith('/applications/antigravity.app.orig/')
-  ) {
-    return true;
+function toPosixLower(rawPath) {
+  return String(rawPath || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+function getOfficialWindowsRootSet(env = process.env, homeDir = os.homedir()) {
+  const roots = new Set();
+  const localAppData = env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+  const candidates = [
+    path.join(localAppData, 'Programs', 'Antigravity'),
+    path.join(localAppData, 'Programs', 'Antigravity.orig'),
+    env.ProgramFiles ? path.join(env.ProgramFiles, 'Antigravity') : null,
+    env.ProgramFiles ? path.join(env.ProgramFiles, 'Antigravity.orig') : null,
+    env['ProgramFiles(x86)'] ? path.join(env['ProgramFiles(x86)'], 'Antigravity') : null,
+    env['ProgramFiles(x86)'] ? path.join(env['ProgramFiles(x86)'], 'Antigravity.orig') : null,
+  ].filter(Boolean);
+  for (const c of candidates) {
+    roots.add(toPosixLower(path.resolve(c)));
   }
-  const parts = normalized.split('/').filter(Boolean);
-  for (const part of parts) {
-    if (OFFICIAL_ANTIGRAVITY_NAMES.has(part)) return true;
+  return roots;
+}
+
+function matchesOfficialBundlePath(candidatePath) {
+  const rawPosix = toPosixLower(candidatePath);
+  const resolvedPosix = toPosixLower(path.resolve(String(candidatePath || '')));
+  const forms = new Set([rawPosix, resolvedPosix]);
+
+  // Strip optional Windows drive prefix (e.g. "c:/applications/antigravity.app" -> "/applications/antigravity.app")
+  for (const f of [...forms]) {
+    const withoutDrive = f.replace(/^[a-z]:(?=\/)/, '');
+    if (withoutDrive !== f) forms.add(withoutDrive);
+  }
+
+  for (const normalized of forms) {
+    if (
+      normalized === '/applications/antigravity.app' ||
+      normalized.startsWith('/applications/antigravity.app/') ||
+      normalized === '/applications/antigravity.app.orig' ||
+      normalized.startsWith('/applications/antigravity.app.orig/')
+    ) {
+      return true;
+    }
+    const parts = normalized.split('/').filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (OFFICIAL_ANTIGRAVITY_NAMES.has(part)) return true;
+      // Windows official install directory patterns (never match Roaming/Antigravity userData)
+      if (
+        OFFICIAL_WIN_DIR_NAMES.has(part) &&
+        i > 0 &&
+        (parts[i - 1] === 'programs' ||
+          parts[i - 1] === 'program files' ||
+          parts[i - 1] === 'program files (x86)')
+      ) {
+        return true;
+      }
+    }
+  }
+
+  if (process.platform === 'win32') {
+    const winRoots = getOfficialWindowsRootSet();
+    for (const root of winRoots) {
+      if (resolvedPosix === root || resolvedPosix.startsWith(`${root}/`)) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -77,7 +161,8 @@ function assertNotOfficialAntigravityApp(targetPath, actionDesc) {
 }
 
 /**
- * Find enclosing *.app bundle directory for any path inside a macOS app bundle.
+ * Find enclosing app root directory for any path inside a macOS .app bundle
+ * or Windows/Linux unpacked Electron app directory.
  */
 function getAppBundleRoot(fromPath) {
   if (!fromPath || typeof fromPath !== 'string') return null;
@@ -85,13 +170,65 @@ function getAppBundleRoot(fromPath) {
   while (true) {
     if (cur.toLowerCase().endsWith('.app')) return cur;
     const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  // Windows / Linux Electron directory layout: <appRoot>/resources[/...]
+  cur = path.resolve(fromPath);
+  while (true) {
+    const base = path.basename(cur).toLowerCase();
+    const parent = path.dirname(cur);
+    if (base === 'resources' && parent !== cur) {
+      if (
+        fs.existsSync(path.join(parent, 'Antigravity.exe')) ||
+        fs.existsSync(path.join(parent, 'hakimi-build-meta.json')) ||
+        fs.existsSync(path.join(cur, 'app.asar'))
+      ) {
+        return parent;
+      }
+    }
+    if (
+      fs.existsSync(path.join(cur, 'Antigravity.exe')) &&
+      fs.existsSync(path.join(cur, 'resources'))
+    ) {
+      return cur;
+    }
     if (parent === cur) return null;
     cur = parent;
   }
 }
 
+function getResourcesDir(appRoot, platform = process.platform) {
+  const resolved = path.resolve(String(appRoot || ''));
+  if (resolved.toLowerCase().endsWith('.app')) {
+    return path.join(resolved, 'Contents', 'Resources');
+  }
+  if (fs.existsSync(path.join(resolved, 'Contents', 'Resources'))) {
+    return path.join(resolved, 'Contents', 'Resources');
+  }
+  if (platform === 'darwin' && !fs.existsSync(path.join(resolved, 'resources'))) {
+    return path.join(resolved, 'Contents', 'Resources');
+  }
+  return path.join(resolved, 'resources');
+}
+
+function getAsarPathForApp(appRoot, platform = process.platform) {
+  return path.join(getResourcesDir(appRoot, platform), 'app.asar');
+}
+
+function getLanguageServerPathForApp(appRoot, platform = process.platform) {
+  const binDir = path.join(getResourcesDir(appRoot, platform), 'bin');
+  if (platform === 'win32' || fs.existsSync(path.join(binDir, 'language_server.exe'))) {
+    return path.join(binDir, 'language_server.exe');
+  }
+  const primary = path.join(binDir, 'language_server');
+  const alt = path.join(binDir, 'language_server_macos_arm');
+  if (fs.existsSync(alt) && !fs.existsSync(primary)) return alt;
+  return primary;
+}
+
 /**
- * Return the writable target macOS app bundle path (never official Antigravity.app).
+ * Return the writable target Hakimi app path (never official Antigravity).
  */
 function getHakimiAppPath() {
   const envPath = process.env.HAKIMI_APP_PATH || process.env.ANTIGRAVITY_TARGET_APP;
@@ -103,7 +240,7 @@ function getHakimiAppPath() {
     const bundle = getAppBundleRoot(process.resourcesPath);
     if (bundle && !isOfficialAntigravityPath(bundle)) return bundle;
   }
-  return DEFAULT_HAKIMI_APP;
+  return getDefaultHakimiAppPath();
 }
 
 function getStateDir() {
@@ -153,11 +290,20 @@ function findAsarPath(customPath) {
     if (process.versions && process.versions.electron && process.execPath) {
       const macAsar = path.resolve(path.dirname(process.execPath), '..', 'Resources', 'app.asar');
       if (!isOfficialAntigravityPath(macAsar)) candidates.push(macAsar);
+      const winAsar = path.resolve(path.dirname(process.execPath), 'resources', 'app.asar');
+      if (!isOfficialAntigravityPath(winAsar)) candidates.push(winAsar);
     }
-    const hakimiAsar = path.join(getHakimiAppPath(), 'Contents', 'Resources', 'app.asar');
-    if (!isOfficialAntigravityPath(hakimiAsar)) candidates.push(hakimiAsar);
-    const defaultAsar = path.join(DEFAULT_HAKIMI_APP, 'Contents', 'Resources', 'app.asar');
-    if (!isOfficialAntigravityPath(defaultAsar)) candidates.push(defaultAsar);
+    const hakimiRoot = getHakimiAppPath();
+    for (const candidate of [
+      getAsarPathForApp(hakimiRoot),
+      path.join(hakimiRoot, 'Contents', 'Resources', 'app.asar'),
+      path.join(hakimiRoot, 'resources', 'app.asar'),
+      getAsarPathForApp(DEFAULT_HAKIMI_APP),
+    ]) {
+      if (!isOfficialAntigravityPath(candidate) && !candidates.includes(candidate)) {
+        candidates.push(candidate);
+      }
+    }
 
     for (const candidate of candidates) {
       try {
@@ -349,7 +495,9 @@ const builtinAsar = {
               const srcUnpacked = path.join(unpackedRoot, ...nextParts);
               if (fs.existsSync(srcUnpacked)) {
                 fs.copyFileSync(srcUnpacked, nextDest);
-                if (child.executable) fs.chmodSync(nextDest, 0o755);
+                if (child.executable) {
+                  try { fs.chmodSync(nextDest, 0o755); } catch {}
+                }
               }
               continue;
             }
@@ -365,7 +513,9 @@ const builtinAsar = {
               }
             }
             fs.writeFileSync(nextDest, buf);
-            if (child && child.executable) fs.chmodSync(nextDest, 0o755);
+            if (child && child.executable) {
+              try { fs.chmodSync(nextDest, 0o755); } catch {}
+            }
           }
         }
         walk(header, destDir, []);
@@ -426,13 +576,21 @@ const builtinAsar = {
           if (!entry.isFile()) continue;
 
           const stat = fs.statSync(fullPath);
-          const executable = (stat.mode & 0o111) !== 0;
+          const preserveExec = opts.preserveExecutable;
+          const preservedExecutable =
+            typeof preserveExec === 'function'
+              ? Boolean(preserveExec(relPosix))
+              : preserveExec && typeof preserveExec.has === 'function'
+                ? preserveExec.has(relPosix)
+                : false;
+          const executable = preservedExecutable || (process.platform !== 'win32' && (stat.mode & 0o111) !== 0);
 
           if (isUnpacked(relPosix)) {
             const node = {
               size: stat.size,
               unpacked: true,
             };
+            if (preservedExecutable) node.executable = true;
             filesMap[entry.name] = node;
             if (copyUnpacked) unpackedQueue.push({ fullPath, relPosix, mode: stat.mode });
             continue;
@@ -489,7 +647,13 @@ function loadAsarEngine() {
 
 module.exports = {
   OFFICIAL_ANTIGRAVITY_NAMES,
+  OFFICIAL_WIN_DIR_NAMES,
   DEFAULT_HAKIMI_APP,
+  getDefaultHakimiAppPath,
+  getDefaultOfficialAppPath,
+  getResourcesDir,
+  getAsarPathForApp,
+  getLanguageServerPathForApp,
   withNoAsar,
   isOfficialAntigravityPath,
   assertNotOfficialAntigravityApp,

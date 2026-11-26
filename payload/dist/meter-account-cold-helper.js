@@ -33,6 +33,8 @@ const COLD_HELPER_FILE_NAME = 'cold-switch-helper.js';
 const COLD_LOG_FILE_NAME = 'cold-switch.log';
 const SECURITY_BIN = '/usr/bin/security';
 const SECURITY_TIMEOUT_MS = 8000;
+const WINCRED_TIMEOUT_MS = 12000;
+const WINCRED_MAX_BLOB_BYTES = 2560;
 const GO_KEYRING_B64_PREFIX = 'go-keyring-base64:';
 const SAFE_SHELL_TOKEN_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 
@@ -66,7 +68,7 @@ const RELAUNCH_STRIP_ENV_KEYS = [
 ];
 
 function isSupportedPlatform(platform = process.platform) {
-  return platform === 'darwin';
+  return platform === 'darwin' || platform === 'win32';
 }
 
 function getDefaultStateDir(platform = process.platform, env = process.env, homeDir = os.homedir()) {
@@ -103,19 +105,35 @@ function getDefaultAgDir(env = process.env, homeDir = os.homedir()) {
 function isOfficialAntigravityBundle(targetPath) {
   if (!targetPath || typeof targetPath !== 'string') return false;
   const resolved = path.resolve(targetPath);
-  const candidates = [resolved];
+  const candidates = [targetPath, resolved];
   try {
     candidates.push(fs.realpathSync(resolved));
   } catch {}
   for (const p of candidates) {
-    const clean = p.replace(/\/+$/, '');
-    if (
-      clean === '/Applications/Antigravity.app' ||
-      clean === '/Applications/Antigravity.app.orig' ||
-      clean.startsWith('/Applications/Antigravity.app/') ||
-      clean.startsWith('/Applications/Antigravity.app.orig/')
-    ) {
-      return true;
+    const clean = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const noDrive = clean.replace(/^[a-z]:(?=\/)/, '');
+    for (const form of [clean, noDrive]) {
+      if (
+        form === '/applications/antigravity.app' ||
+        form === '/applications/antigravity.app.orig' ||
+        form.startsWith('/applications/antigravity.app/') ||
+        form.startsWith('/applications/antigravity.app.orig/')
+      ) {
+        return true;
+      }
+      const parts = form.split('/').filter(Boolean);
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === 'antigravity.app' || parts[i] === 'antigravity.app.orig') return true;
+        if (
+          (parts[i] === 'antigravity' || parts[i] === 'antigravity.orig') &&
+          i > 0 &&
+          (parts[i - 1] === 'programs' ||
+            parts[i - 1] === 'program files' ||
+            parts[i - 1] === 'program files (x86)')
+        ) {
+          return true;
+        }
+      }
     }
   }
   return false;
@@ -252,6 +270,289 @@ function createMacOsKeychainAdapter(execImpl = execFileSync) {
       }
     },
   };
+}
+
+function formatWindowsCredTarget(service, account) {
+  const s = String(service || '');
+  const a = String(account || '');
+  if (!s || !a) throw new Error('Windows 凭据参数不能为空');
+  if (/[\r\n\0]/.test(s) || /[\r\n\0]/.test(a)) {
+    throw new Error('Windows 凭据参数包含非法控制字符');
+  }
+  return `${s}:${a}`;
+}
+
+function encodeAsciiJson(obj) {
+  return JSON.stringify(obj).replace(/[\u0080-\uffff]/g, (ch) =>
+    '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')
+  );
+}
+
+const WINCRED_PS_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  '$rawIn = [Console]::In.ReadToEnd()',
+  '$req = $rawIn | ConvertFrom-Json',
+  "Add-Type -TypeDefinition @'",
+  'using System;',
+  'using System.Runtime.InteropServices;',
+  'public static class HakimiWinCred {',
+  '    public const uint CRED_TYPE_GENERIC = 1;',
+  '    public const uint CRED_PERSIST_LOCAL_MACHINE = 2;',
+  '    public const int ERROR_NOT_FOUND = 1168;',
+  '    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+  '    public struct CREDENTIAL {',
+  '        public uint Flags;',
+  '        public uint Type;',
+  '        public string TargetName;',
+  '        public string Comment;',
+  '        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;',
+  '        public uint CredentialBlobSize;',
+  '        public IntPtr CredentialBlob;',
+  '        public uint Persist;',
+  '        public uint AttributeCount;',
+  '        public IntPtr Attributes;',
+  '        public string TargetAlias;',
+  '        public string UserName;',
+  '    }',
+  '    [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]',
+  '    public static extern bool CredRead(string target, uint type, uint reservedFlag, out IntPtr credPtr);',
+  '    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]',
+  '    public static extern bool CredWrite([In] ref CREDENTIAL userCredential, uint flags);',
+  '    [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]',
+  '    public static extern bool CredDelete(string target, uint type, uint flags);',
+  '    [DllImport("advapi32.dll", EntryPoint = "CredFree", SetLastError = true)]',
+  '    public static extern void CredFree(IntPtr cred);',
+  '    public static int Has(string target) {',
+  '        IntPtr ptr;',
+  '        if (!CredRead(target, CRED_TYPE_GENERIC, 0, out ptr)) {',
+  '            int err = Marshal.GetLastWin32Error();',
+  '            return err == ERROR_NOT_FOUND ? 0 : -err;',
+  '        }',
+  '        CredFree(ptr);',
+  '        return 1;',
+  '    }',
+  '    public static string GetBase64(string target, out int errCode) {',
+  '        errCode = 0;',
+  '        IntPtr ptr;',
+  '        if (!CredRead(target, CRED_TYPE_GENERIC, 0, out ptr)) {',
+  '            errCode = Marshal.GetLastWin32Error();',
+  '            return null;',
+  '        }',
+  '        try {',
+  '            CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));',
+  '            byte[] blob = new byte[c.CredentialBlobSize];',
+  '            if (c.CredentialBlobSize > 0 && c.CredentialBlob != IntPtr.Zero) {',
+  '                Marshal.Copy(c.CredentialBlob, blob, 0, (int)c.CredentialBlobSize);',
+  '            }',
+  '            return Convert.ToBase64String(blob);',
+  '        } finally {',
+  '            CredFree(ptr);',
+  '        }',
+  '    }',
+  '    public static int SetBase64(string target, string userName, string valueB64) {',
+  '        byte[] bytes = Convert.FromBase64String(valueB64);',
+  '        IntPtr blobPtr = IntPtr.Zero;',
+  '        try {',
+  '            if (bytes.Length > 0) {',
+  '                blobPtr = Marshal.AllocHGlobal(bytes.Length);',
+  '                Marshal.Copy(bytes, 0, blobPtr, bytes.Length);',
+  '            }',
+  '            CREDENTIAL cred = new CREDENTIAL();',
+  '            cred.Type = CRED_TYPE_GENERIC;',
+  '            cred.TargetName = target;',
+  '            cred.UserName = userName;',
+  '            cred.Persist = CRED_PERSIST_LOCAL_MACHINE;',
+  '            cred.CredentialBlobSize = (uint)bytes.Length;',
+  '            cred.CredentialBlob = blobPtr;',
+  '            if (!CredWrite(ref cred, 0)) {',
+  '                return Marshal.GetLastWin32Error();',
+  '            }',
+  '            return 0;',
+  '        } finally {',
+  '            if (blobPtr != IntPtr.Zero) {',
+  '                if (bytes.Length > 0) {',
+  '                    byte[] zeros = new byte[bytes.Length];',
+  '                    Marshal.Copy(zeros, 0, blobPtr, zeros.Length);',
+  '                }',
+  '                Marshal.FreeHGlobal(blobPtr);',
+  '            }',
+  '            Array.Clear(bytes, 0, bytes.Length);',
+  '        }',
+  '    }',
+  '    public static int Delete(string target) {',
+  '        if (!CredDelete(target, CRED_TYPE_GENERIC, 0)) {',
+  '            int err = Marshal.GetLastWin32Error();',
+  '            return err == ERROR_NOT_FOUND ? 0 : -err;',
+  '        }',
+  '        return 1;',
+  '    }',
+  '}',
+  "'@",
+  "$act = [string]$req.action",
+  "if ($act -eq 'has') {",
+  '    $rc = [HakimiWinCred]::Has([string]$req.target)',
+  '    if ($rc -lt 0) { @{ ok = $false; win32Error = (-$rc) } | ConvertTo-Json -Compress }',
+  '    else { @{ ok = $true; found = ($rc -eq 1) } | ConvertTo-Json -Compress }',
+  "} elseif ($act -eq 'hasMany') {",
+  '    $map = @{}',
+  '    foreach ($t in @($req.targets)) {',
+  '        $rc = [HakimiWinCred]::Has([string]$t)',
+  '        if ($rc -lt 0) { $map[[string]$t] = $false } else { $map[[string]$t] = ($rc -eq 1) }',
+  '    }',
+  '    @{ ok = $true; foundMap = $map } | ConvertTo-Json -Compress',
+  "} elseif ($act -eq 'get') {",
+  '    $err = 0',
+  '    $b64 = [HakimiWinCred]::GetBase64([string]$req.target, [ref]$err)',
+  '    if ($null -eq $b64) {',
+  '        if ($err -eq 1168) { @{ ok = $true; found = $false } | ConvertTo-Json -Compress }',
+  '        else { @{ ok = $false; win32Error = $err } | ConvertTo-Json -Compress }',
+  '    } else {',
+  '        @{ ok = $true; found = $true; valueB64 = $b64 } | ConvertTo-Json -Compress',
+  '    }',
+  "} elseif ($act -eq 'set') {",
+  '    $err = [HakimiWinCred]::SetBase64([string]$req.target, [string]$req.userName, [string]$req.valueB64)',
+  '    if ($err -eq 0) { @{ ok = $true } | ConvertTo-Json -Compress }',
+  '    else { @{ ok = $false; win32Error = $err } | ConvertTo-Json -Compress }',
+  "} elseif ($act -eq 'delete') {",
+  '    $rc = [HakimiWinCred]::Delete([string]$req.target)',
+  '    if ($rc -lt 0) { @{ ok = $false; win32Error = (-$rc) } | ConvertTo-Json -Compress }',
+  '    else { @{ ok = $true; deleted = ($rc -eq 1) } | ConvertTo-Json -Compress }',
+  '} else {',
+  "    @{ ok = $false; error = 'unknown action' } | ConvertTo-Json -Compress",
+  '}',
+].join('\n');
+
+let cachedWinCredEncodedCmd = null;
+function getWinCredEncodedCommand() {
+  if (!cachedWinCredEncodedCmd) {
+    cachedWinCredEncodedCmd = Buffer.from(WINCRED_PS_SCRIPT, 'utf16le').toString('base64');
+  }
+  return cachedWinCredEncodedCmd;
+}
+
+function sanitizeWinCredError(err, fallbackMsg) {
+  const raw = Buffer.isBuffer(err?.stderr)
+    ? err.stderr.toString('utf8').trim()
+    : String(err?.message || '').trim();
+  if (/ETIMEDOUT|timed out/i.test(raw)) {
+    return '访问 Windows 凭据管理器超时，请重试';
+  }
+  const firstLine = raw.split(/\r?\n/)[0] || '';
+  if (firstLine && firstLine.length <= 140 && !firstLine.includes(GO_KEYRING_B64_PREFIX) && !firstLine.includes('valueB64')) {
+    return `${fallbackMsg}: ${firstLine}`;
+  }
+  return fallbackMsg;
+}
+
+/**
+ * Windows Credential Manager adapter using native advapi32.dll P/Invoke via PowerShell.
+ * - Matches `zalando/go-keyring` (`danieljoos/wincred`) format:
+ *   TargetName = "<service>:<account>", UserName = "<account>",
+ *   Type = CRED_TYPE_GENERIC (1), Persist = CRED_PERSIST_LOCAL_MACHINE (2),
+ *   CredentialBlob = raw UTF-8 bytes.
+ * - Zero plaintext secrets in CLI arguments, env vars, or disk files (JSON passed via stdin).
+ */
+function createWindowsKeychainAdapter(execImpl = execFileSync) {
+  const invokeWinCred = (payloadObj, fallbackErr) => {
+    let stdout = '';
+    try {
+      stdout = execImpl(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', getWinCredEncodedCommand()],
+        {
+          input: encodeAsciiJson(payloadObj),
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: WINCRED_TIMEOUT_MS,
+          windowsHide: true,
+        }
+      );
+    } catch (err) {
+      throw new Error(sanitizeWinCredError(err, fallbackErr));
+    }
+    const lines = String(stdout || '').trim().split(/\r?\n/).filter(Boolean);
+    const lastLine = lines[lines.length - 1] || '';
+    let parsed = null;
+    try {
+      parsed = JSON.parse(lastLine);
+    } catch {
+      throw new Error(fallbackErr);
+    }
+    if (!parsed || parsed.ok !== true) {
+      const codeSuffix = parsed?.win32Error ? ` (Win32 error ${parsed.win32Error})` : '';
+      throw new Error(`${fallbackErr}${codeSuffix}`);
+    }
+    return parsed;
+  };
+
+  return {
+    has(service, account) {
+      if (!service || !account) return false;
+      const target = formatWindowsCredTarget(service, account);
+      const res = invokeWinCred({ action: 'has', target }, '检查 Windows 凭据条目失败');
+      return Boolean(res.found);
+    },
+
+    hasMany(service, accounts) {
+      const out = {};
+      const list = Array.isArray(accounts) ? accounts.filter(Boolean) : [];
+      if (!service || list.length === 0) return out;
+      const targetByAccount = new Map();
+      const targets = [];
+      for (const acc of list) {
+        const t = formatWindowsCredTarget(service, acc);
+        targetByAccount.set(String(acc), t);
+        targets.push(t);
+      }
+      const res = invokeWinCred({ action: 'hasMany', targets }, '批量检查 Windows 凭据条目失败');
+      const foundMap = res.foundMap && typeof res.foundMap === 'object' ? res.foundMap : {};
+      for (const [acc, t] of targetByAccount.entries()) {
+        out[acc] = Boolean(foundMap[t]);
+      }
+      return out;
+    },
+
+    get(service, account) {
+      if (!service || !account) return null;
+      const target = formatWindowsCredTarget(service, account);
+      const res = invokeWinCred({ action: 'get', target }, '读取 Windows 凭据失败');
+      if (!res.found || typeof res.valueB64 !== 'string') return null;
+      const decoded = Buffer.from(res.valueB64, 'base64').toString('utf8');
+      return decoded.length > 0 ? decoded : null;
+    },
+
+    set(service, account, value) {
+      if (!service || !account || typeof value !== 'string' || value.length === 0) {
+        throw new Error('无效的 Windows 凭据写入参数');
+      }
+      const target = formatWindowsCredTarget(service, account);
+      const bytes = Buffer.from(value, 'utf8');
+      if (bytes.length > WINCRED_MAX_BLOB_BYTES) {
+        throw new Error(`凭据大小 (${bytes.length} 字节) 超出 Windows 凭据管理器上限 (${WINCRED_MAX_BLOB_BYTES} 字节)`);
+      }
+      invokeWinCred(
+        { action: 'set', target, userName: String(account), valueB64: bytes.toString('base64') },
+        '写入 Windows 凭据失败'
+      );
+      return true;
+    },
+
+    delete(service, account) {
+      if (!service || !account) return false;
+      const target = formatWindowsCredTarget(service, account);
+      const res = invokeWinCred({ action: 'delete', target }, '删除 Windows 凭据失败');
+      return Boolean(res.deleted);
+    },
+  };
+}
+
+function createPlatformKeychainAdapter(options = {}) {
+  const plat = options.platform || process.platform;
+  const execImpl = options.execFileSync || execFileSync;
+  if (plat === 'win32') {
+    return createWindowsKeychainAdapter(execImpl);
+  }
+  return createMacOsKeychainAdapter(execImpl);
 }
 
 function computeTokenFingerprint(rawSecret) {
@@ -571,33 +872,94 @@ function listPsProcesses(execImpl = execFileSync) {
   return rows;
 }
 
+function listWinProcesses(execImpl = execFileSync) {
+  const psScript = [
+    '$procs = Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine;',
+    'if ($procs) { $procs | ConvertTo-Json -Compress } else { "[]" }',
+  ].join(' ');
+  const out = execImpl(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+    {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 6000,
+      windowsHide: true,
+    }
+  );
+  const trimmed = String(out || '').trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    const parsed = JSON.parse(trimmed);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    const rows = [];
+    for (const item of list) {
+      if (!item) continue;
+      const pid = Number(item.ProcessId);
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+      rows.push({
+        pid,
+        name: String(item.Name || ''),
+        executablePath: String(item.ExecutablePath || ''),
+        command: String(item.CommandLine || item.ExecutablePath || item.Name || ''),
+      });
+    }
+    return rows;
+  }
+  // Fallback: handle mocked Unix `ps` output in cross-platform unit tests
+  const rows = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const m = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    rows.push({ pid, name: '', executablePath: '', command: m[2] });
+  }
+  return rows;
+}
+
+function isWindowsAppPath(targetAppPath, platform = process.platform) {
+  if (!targetAppPath) return platform === 'win32';
+  const lower = String(targetAppPath).toLowerCase();
+  if (lower.endsWith('.app') || lower.endsWith('.app.orig')) return false;
+  return platform === 'win32';
+}
+
 /**
  * Detect running `agy` CLI processes (or `agy`-owned `language_server` with
  * `--app_data_dir antigravity-cli`) that share the global ("gemini", "antigravity")
- * macOS Keychain slot.
+ * system credential slot.
  */
 function detectRunningAgyCliProcesses(options = {}) {
   const execImpl = options.execFileSync || execFileSync;
+  const plat = options.platform || process.platform;
   const selfPids = new Set([process.pid, ...(Array.isArray(options.excludePids) ? options.excludePids : [])]);
   let rows = [];
   try {
-    rows = listPsProcesses(execImpl);
+    rows = plat === 'win32' ? listWinProcesses(execImpl) : listPsProcesses(execImpl);
   } catch {
     return [];
   }
   const matched = [];
   for (const row of rows) {
     if (selfPids.has(row.pid)) continue;
-    const cmd = row.command.trim();
-    if (!cmd) continue;
-    const firstToken = cmd.split(/\s+/)[0] || '';
-    const base = path.basename(firstToken);
-    const isAgyBin = base === 'agy' || /(?:^|\/)agy$/.test(firstToken);
+    const cmd = String(row.command || '').trim();
+    const exePath = String(row.executablePath || '').trim();
+    const procName = String(row.name || '').trim().toLowerCase();
+    if (!cmd && !exePath && !procName) continue;
+    const firstToken = exePath || (cmd.split(/\s+/)[0] || '').replace(/^"|"$/g, '');
+    const base = path.basename(firstToken.replace(/\\/g, '/')).toLowerCase();
+    const isAgyBin =
+      base === 'agy' ||
+      base === 'agy.exe' ||
+      procName === 'agy.exe' ||
+      /(?:^|[\\/])agy(?:\.exe)?$/i.test(firstToken);
     const isAgyLs =
-      /(?:^|\/)language_server(?:\s|$)/.test(firstToken) &&
-      /--app_data_dir(?:=|\s+)antigravity-cli(?:\s|$)/.test(cmd);
+      (/(?:^|[\\/])language_server(?:\.exe)?(?:\s|$)/i.test(firstToken) ||
+        procName === 'language_server.exe') &&
+      /--app_data_dir(?:=|\s+)["']?antigravity-cli["']?(?:\s|$)/i.test(cmd);
     if (isAgyBin || isAgyLs) {
-      matched.push({ pid: row.pid, command: firstToken });
+      matched.push({ pid: row.pid, command: firstToken || procName });
     }
   }
   return matched;
@@ -606,7 +968,49 @@ function detectRunningAgyCliProcesses(options = {}) {
 function findRunningTargetPids(targetAppPath, mode = 'all', options = {}) {
   if (!targetAppPath) return [];
   const execImpl = options.execFileSync || execFileSync;
+  const plat = options.platform || process.platform;
   const resolvedApp = path.resolve(String(targetAppPath));
+  const selfPids = new Set([process.pid, ...(Array.isArray(options.excludePids) ? options.excludePids : [])]);
+
+  if (isWindowsAppPath(targetAppPath, plat)) {
+    let normRoot = resolvedApp;
+    try {
+      if (fs.existsSync(resolvedApp)) normRoot = fs.realpathSync(resolvedApp);
+    } catch {}
+    const prefixes = new Set([
+      resolvedApp.replace(/[\\/]+$/, '').toLowerCase() + '\\',
+      normRoot.replace(/[\\/]+$/, '').toLowerCase() + '\\',
+    ]);
+    const mainExecs = new Set([
+      path.join(resolvedApp, 'Antigravity.exe').toLowerCase(),
+      path.join(normRoot, 'Antigravity.exe').toLowerCase(),
+    ]);
+    let rows = [];
+    try {
+      rows = listWinProcesses(execImpl);
+    } catch {
+      return [];
+    }
+    const pids = [];
+    for (const row of rows) {
+      if (selfPids.has(row.pid)) continue;
+      const exeLower = row.executablePath ? path.resolve(row.executablePath).toLowerCase() : '';
+      if (!exeLower) continue;
+      const isMain = mainExecs.has(exeLower);
+      let isUnderApp = false;
+      for (const pref of prefixes) {
+        if (exeLower.startsWith(pref)) {
+          isUnderApp = true;
+          break;
+        }
+      }
+      if (mode === 'main' ? isMain : (isMain || isUnderApp)) {
+        pids.push(row.pid);
+      }
+    }
+    return pids;
+  }
+
   const prefixes = new Set([resolvedApp.replace(/\/+$/, '') + '/']);
   const execs = new Set([path.join(resolvedApp, 'Contents', 'MacOS', 'Antigravity')]);
   try {
@@ -619,7 +1023,6 @@ function findRunningTargetPids(targetAppPath, mode = 'all', options = {}) {
     execs.add(realExec);
   } catch {}
 
-  const selfPids = new Set([process.pid, ...(Array.isArray(options.excludePids) ? options.excludePids : [])]);
   let rows = [];
   try {
     rows = listPsProcesses(execImpl);
@@ -682,8 +1085,10 @@ function stopTargetAppProcesses(targetAppPath, options = {}) {
   const allTermMs = Number.isFinite(options.allTermMs) ? options.allTermMs : 1500;
   const killWaitMs = Number.isFinite(options.killWaitMs) ? options.killWaitMs : 2500;
   const killImpl = options.killImpl || process.kill;
+  const execImpl = options.execFileSync || execFileSync;
   const sleepImpl = options.sleepImpl || sleepMs;
   const findPids = options.findPidsImpl || ((m) => findRunningTargetPids(targetAppPath, m, options));
+  const isWinTarget = isWindowsAppPath(targetAppPath, options.platform || process.platform);
 
   const waitUntilZero = (budgetMs) => {
     const steps = Math.max(1, Math.ceil(budgetMs / Math.max(10, pollIntervalMs)));
@@ -703,21 +1108,55 @@ function stopTargetAppProcesses(targetAppPath, options = {}) {
 
   const mainPids = findPids('main');
   if (mainPids.length > 0) {
-    for (const pid of mainPids) safeKillPid(pid, 'SIGTERM', killImpl);
+    if (isWinTarget && !options.killImpl) {
+      const pidCsv = mainPids.join(',');
+      try {
+        execImpl(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            `Get-Process -Id ${pidCsv} -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }`,
+          ],
+          { stdio: 'ignore', timeout: 4000, windowsHide: true }
+        );
+      } catch {}
+    } else {
+      for (const pid of mainPids) safeKillPid(pid, 'SIGTERM', killImpl);
+    }
     rem = waitUntilZero(mainTermMs);
     if (rem.length === 0) return { ok: true, remaining: [] };
   }
 
-  for (const pid of rem) safeKillPid(pid, 'SIGTERM', killImpl);
-  rem = waitUntilZero(allTermMs);
-  if (rem.length === 0) return { ok: true, remaining: [] };
-
-  const killSteps = Math.max(1, Math.ceil(killWaitMs / Math.max(10, pollIntervalMs)));
-  for (let i = 0; i < killSteps; i++) {
-    rem = findPids('all');
+  if (isWinTarget && !options.killImpl) {
+    for (const pid of rem) {
+      try {
+        execImpl('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+          stdio: 'ignore',
+          timeout: 4000,
+          windowsHide: true,
+        });
+      } catch {
+        safeKillPid(pid, 'SIGKILL', killImpl);
+      }
+    }
+    rem = waitUntilZero(allTermMs + killWaitMs);
     if (rem.length === 0) return { ok: true, remaining: [] };
-    for (const pid of rem) safeKillPid(pid, 'SIGKILL', killImpl);
-    sleepImpl(pollIntervalMs);
+  } else {
+    for (const pid of rem) safeKillPid(pid, 'SIGTERM', killImpl);
+    rem = waitUntilZero(allTermMs);
+    if (rem.length === 0) return { ok: true, remaining: [] };
+
+    const killSteps = Math.max(1, Math.ceil(killWaitMs / Math.max(10, pollIntervalMs)));
+    for (let i = 0; i < killSteps; i++) {
+      rem = findPids('all');
+      if (rem.length === 0) return { ok: true, remaining: [] };
+      for (const pid of rem) safeKillPid(pid, 'SIGKILL', killImpl);
+      sleepImpl(pollIntervalMs);
+    }
   }
 
   rem = findPids('all');
@@ -738,6 +1177,21 @@ function cleanupStaleSingletonLockDir(userDataDir, killImpl = process.kill) {
   try {
     st = fs.lstatSync(lockPath);
   } catch {
+    if (process.platform === 'win32') {
+      const winLockPath = path.join(dir, 'lockfile');
+      if (!fs.existsSync(winLockPath)) {
+        return { cleaned: false, reason: 'no_lock', dir };
+      }
+      try {
+        fs.unlinkSync(winLockPath);
+        return { cleaned: true, pid: null, dir };
+      } catch (err) {
+        if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+          return { cleaned: false, reason: 'owner_alive', dir };
+        }
+        return { cleaned: false, reason: 'unreadable_lock', dir };
+      }
+    }
     return { cleaned: false, reason: 'no_lock', dir };
   }
   if (!st || !st.isSymbolicLink()) {
@@ -876,7 +1330,23 @@ function relaunchTargetApp(targetAppPath, options = {}) {
   if (!targetAppPath) return { ok: false, error: '未指定要重新启动的应用路径' };
   const spawnImpl = options.spawnImpl || spawn;
   const cleanEnv = buildCleanRelaunchEnv(options.env || process.env);
+  const plat = options.platform || process.platform;
   try {
+    if (isWindowsAppPath(targetAppPath, plat)) {
+      const resolved = path.resolve(String(targetAppPath));
+      const exePath = resolved.toLowerCase().endsWith('.exe')
+        ? resolved
+        : path.join(resolved, 'Antigravity.exe');
+      const child = spawnImpl(exePath, [], {
+        cwd: path.dirname(exePath),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        env: cleanEnv,
+      });
+      if (child && typeof child.unref === 'function') child.unref();
+      return { ok: true, exePath };
+    }
     const child = spawnImpl('/usr/bin/open', ['-n', targetAppPath], {
       detached: true,
       stdio: 'ignore',
@@ -970,7 +1440,12 @@ function executeColdAccountJob(job, options = {}) {
     return { ok: false, error: '安全拦截：禁止对官方原版 Antigravity.app 执行进程关闭或冷切重启' };
   }
 
-  const kc = options.keychain || createMacOsKeychainAdapter(options.execFileSync || execFileSync);
+  const kc =
+    options.keychain ||
+    createPlatformKeychainAdapter({
+      platform: options.platform || process.platform,
+      execFileSync: options.execFileSync || execFileSync,
+    });
   const commonOpts = { ...options, stateDir, userDataDir, geminiDir, homeDir };
 
   const finalize = (result, { suppressRelaunch = false } = {}) => {
@@ -1238,6 +1713,9 @@ module.exports = {
   isSecurityNotFoundError,
   sanitizeSecurityError,
   createMacOsKeychainAdapter,
+  formatWindowsCredTarget,
+  createWindowsKeychainAdapter,
+  createPlatformKeychainAdapter,
   computeTokenFingerprint,
   normalizeEmail,
   sanitizeProfileId,
@@ -1261,6 +1739,8 @@ module.exports = {
   findMatchingProfile,
   upsertProfileWithSecret,
   listPsProcesses,
+  listWinProcesses,
+  isWindowsAppPath,
   detectRunningAgyCliProcesses,
   findRunningTargetPids,
   stopTargetAppProcesses,

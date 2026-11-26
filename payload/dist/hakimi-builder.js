@@ -1022,7 +1022,8 @@ function readBundleShortVersion(plistPath) {
 function readInstalledBuildMeta(appBundlePath) {
   const bundle = appBundlePath ? path.resolve(String(appBundlePath)) : asarEngine.getHakimiAppPath();
   const plistPath = path.join(bundle, 'Contents', 'Info.plist');
-  const metaPath = path.join(bundle, 'Contents', 'Resources', BUILD_META_FILENAME);
+  const resDir = asarEngine.getResourcesDir(bundle);
+  const metaPath = path.join(resDir, BUILD_META_FILENAME);
   const plistVersion = readBundleShortVersion(plistPath);
   const res = upgradeHelper.readJsonFileSafe(metaPath, null);
   const parsed = res.ok && res.data && typeof res.data === 'object' ? res.data : {};
@@ -1045,7 +1046,8 @@ function readInstalledBuildMeta(appBundlePath) {
 function writeBuildMeta(appBundlePath, meta = {}) {
   const bundle = path.resolve(String(appBundlePath));
   asarEngine.assertNotOfficialAntigravityApp(bundle, '写入构建回执');
-  const metaPath = path.join(bundle, 'Contents', 'Resources', BUILD_META_FILENAME);
+  const resDir = asarEngine.getResourcesDir(bundle);
+  const metaPath = path.join(resDir, BUILD_META_FILENAME);
   const commit = typeof meta.hakimiCommit === 'string' && SHA40_RE.test(meta.hakimiCommit.trim())
     ? meta.hakimiCommit.trim()
     : null;

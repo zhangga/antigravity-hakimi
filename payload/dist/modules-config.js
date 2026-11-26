@@ -3,7 +3,15 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { getStateDir, findAsarPath, builtinAsar, assertNotOfficialAntigravityApp, getHakimiAppPath } = require('./asar-engine');
+const {
+  getStateDir,
+  findAsarPath,
+  builtinAsar,
+  assertNotOfficialAntigravityApp,
+  getHakimiAppPath,
+  getDefaultOfficialAppPath,
+  getAsarPathForApp,
+} = require('./asar-engine');
 
 const SCHEMA_VERSION = '0.8.3';
 const PROJECT_VERSION = '0.8.3';
@@ -327,17 +335,92 @@ function compareBundleSemver(a, b) {
   return pa.pre > pb.pre ? 1 : -1;
 }
 
-function checkAppVersionSync(options = {}) {
-  const officialPlist =
-    options.officialPlist ||
-    (fs.existsSync('/Applications/Antigravity.app.orig/Contents/Info.plist')
-      ? '/Applications/Antigravity.app.orig/Contents/Info.plist'
-      : '/Applications/Antigravity.app/Contents/Info.plist');
-  const hakimiPlist =
-    options.hakimiPlist || path.join(getHakimiAppPath(), 'Contents', 'Info.plist');
+function readAppVersion(appPathOrPlist) {
+  if (!appPathOrPlist) return null;
+  const target = String(appPathOrPlist);
+  try {
+    if (target.toLowerCase().endsWith('.plist')) {
+      return readBundleShortVersion(target);
+    }
+    if (!fs.existsSync(target)) return null;
+    const st = fs.statSync(target);
+    if (st.isFile()) {
+      if (target.toLowerCase().endsWith('.asar')) {
+        const pkg = JSON.parse(builtinAsar.extractFile(target, 'package.json').toString('utf8'));
+        return pkg?.version ? String(pkg.version).trim() : null;
+      }
+      if (target.toLowerCase().endsWith('.json')) {
+        const meta = JSON.parse(fs.readFileSync(target, 'utf8'));
+        const ver = meta?.antigravityVersion || meta?.version;
+        return ver ? String(ver).trim() : null;
+      }
+      return readBundleShortVersion(target);
+    }
+    // Directory: check macOS Info.plist first, then Windows/Linux app.asar package.json, then build meta
+    const plistPath = path.join(target, 'Contents', 'Info.plist');
+    if (fs.existsSync(plistPath)) {
+      const v = readBundleShortVersion(plistPath);
+      if (v) return v;
+    }
+    const asarCandidates = [
+      getAsarPathForApp(target),
+      path.join(target, 'resources', 'app.asar'),
+      path.join(target, 'Contents', 'Resources', 'app.asar'),
+    ];
+    for (const asarFile of asarCandidates) {
+      if (fs.existsSync(asarFile)) {
+        try {
+          const pkg = JSON.parse(builtinAsar.extractFile(asarFile, 'package.json').toString('utf8'));
+          if (pkg?.version) return String(pkg.version).trim();
+        } catch {}
+      }
+    }
+    const metaCandidates = [
+      path.join(target, 'resources', 'hakimi-build-meta.json'),
+      path.join(target, 'Contents', 'Resources', 'hakimi-build-meta.json'),
+    ];
+    for (const metaFile of metaCandidates) {
+      if (fs.existsSync(metaFile)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          if (meta?.antigravityVersion) return String(meta.antigravityVersion).trim();
+        } catch {}
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-  const officialVersion = readBundleShortVersion(officialPlist);
-  const hakimiVersion = readBundleShortVersion(hakimiPlist);
+function checkAppVersionSync(options = {}) {
+  let officialVersion = null;
+  let hakimiVersion = null;
+
+  if (options.officialPlist || options.hakimiPlist) {
+    const officialPlist =
+      options.officialPlist ||
+      (fs.existsSync('/Applications/Antigravity.app.orig/Contents/Info.plist')
+        ? '/Applications/Antigravity.app.orig/Contents/Info.plist'
+        : '/Applications/Antigravity.app/Contents/Info.plist');
+    const hakimiPlist =
+      options.hakimiPlist || path.join(getHakimiAppPath(), 'Contents', 'Info.plist');
+    officialVersion = readBundleShortVersion(officialPlist);
+    hakimiVersion = readBundleShortVersion(hakimiPlist);
+  } else if (process.platform === 'darwin' && !options.officialApp && !options.hakimiApp) {
+    const officialPlist = fs.existsSync('/Applications/Antigravity.app.orig/Contents/Info.plist')
+      ? '/Applications/Antigravity.app.orig/Contents/Info.plist'
+      : '/Applications/Antigravity.app/Contents/Info.plist';
+    const hakimiPlist = path.join(getHakimiAppPath(), 'Contents', 'Info.plist');
+    officialVersion = readBundleShortVersion(officialPlist);
+    hakimiVersion = readBundleShortVersion(hakimiPlist);
+  } else {
+    const officialApp = options.officialApp || getDefaultOfficialAppPath();
+    const hakimiApp = options.hakimiApp || getHakimiAppPath();
+    officialVersion = readAppVersion(officialApp);
+    hakimiVersion = readAppVersion(hakimiApp);
+  }
+
   const cmp = officialVersion && hakimiVersion ? compareBundleSemver(officialVersion, hakimiVersion) : 0;
 
   return {
@@ -360,6 +443,23 @@ function getDefaultUserDataDir() {
 
 function cleanupStaleSingletonLock(userDataDir) {
   const dir = userDataDir ? path.resolve(String(userDataDir)) : getDefaultUserDataDir();
+  if (process.platform === 'win32') {
+    // On Windows, Chromium uses an OS-locked `lockfile` in userDataDir.
+    // Unlinking fails with EBUSY/EPERM while any owning process is alive.
+    const winLockPath = path.join(dir, 'lockfile');
+    if (!fs.existsSync(winLockPath)) {
+      return { cleaned: false, reason: 'no_lock', dir };
+    }
+    try {
+      fs.unlinkSync(winLockPath);
+      return { cleaned: true, pid: null, dir };
+    } catch (err) {
+      if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+        return { cleaned: false, reason: 'owner_alive', dir };
+      }
+      return { cleaned: false, reason: 'unreadable_lock', dir };
+    }
+  }
   const lockPath = path.join(dir, 'SingletonLock');
   let st;
   try {
@@ -411,6 +511,8 @@ module.exports = {
   acquireFileLock,
   inspectDiskModules,
   readBundleShortVersion,
+  readAppVersion,
+  compareBundleSemver,
   checkAppVersionSync,
   getDefaultUserDataDir,
   cleanupStaleSingletonLock,

@@ -174,6 +174,15 @@ function packHakimiAsar(rawOpts = {}) {
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hakimi-asar-'));
   try {
+    const srcHeader = readAsarHeader(srcAsar).header;
+    const srcCollected = collectAsarEntries(srcHeader);
+    const srcExecutablePaths = new Set();
+    for (const [rel, node] of srcCollected.files.entries()) {
+      if (node && node.executable) {
+        srcExecutablePaths.add(rel);
+      }
+    }
+
     builtinAsar.extractAll(srcAsar, workDir);
 
     // 1. Clean & inject dist/utils.js
@@ -324,6 +333,7 @@ function packHakimiAsar(rawOpts = {}) {
     builtinAsar.createPackageWithOptions(workDir, destAsar, {
       unpackDir: '**/chrome-devtools-mcp',
       skipUnpackedWrite: true,
+      preserveExecutable: srcExecutablePaths,
     });
 
     verifyHeaderMetadataPreserved(srcAsar, destAsar);
