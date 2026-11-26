@@ -13,6 +13,8 @@ const upgradeHelper = require(path.join(ROOT, 'payload', 'dist', 'hakimi-upgrade
 const coldHelper = require(path.join(ROOT, 'payload', 'dist', 'meter-account-cold-helper'));
 const enhance = require(path.join(ROOT, 'payload', 'dist', 'meter-enhance'));
 const switcher = require(path.join(ROOT, 'payload', 'dist', 'meter-account-switcher'));
+const builder = require(path.join(ROOT, 'payload', 'dist', 'hakimi-builder'));
+const updaterMod = require(path.join(ROOT, 'payload', 'dist', 'hakimi-updater'));
 const buildWin = require(path.join(ROOT, 'scripts', 'build-hakimi-win'));
 const doctor = require(path.join(ROOT, 'scripts', 'doctor'));
 
@@ -20,6 +22,17 @@ function withTempDir(prefix, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
     return fn(dir);
+  } finally {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+async function withTempDirAsync(prefix, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  try {
+    return await fn(dir);
   } finally {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -591,4 +604,275 @@ test('meter-account-cold-helper runs standalone outside repo on Windows with zer
     assert.equal(typeof mod.createWindowsKeychainAdapter, 'function');
   });
 });
+
+// =========================================================================
+// Phase 4: Windows Dual-Source Silent Auto-Updater & Atomic Cold Swap Tests
+// =========================================================================
+
+test('Windows official manifest parser selects Antigravity-x64.exe and verifies Google Authenticode', async () => {
+  const sampleYml = [
+    'version: 2.35.2',
+    'files:',
+    '  - url: https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2/windows-x64/Antigravity-x64.exe',
+    '    sha512: TEST_WIN_SHA512==',
+    '    size: 170273968',
+    'path: Antigravity-x64.exe',
+    'sha512: TEST_WIN_SHA512==',
+  ].join('\n');
+
+  let requestedUrl = '';
+  const manifest = await builder.fetchOfficialLatestManifest({
+    platform: 'win32',
+    arch: 'x64',
+    feedUrl: 'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/',
+    httpRequest: async (url) => {
+      requestedUrl = url;
+      return { status: 200, text: sampleYml };
+    },
+  });
+  assert.equal(requestedUrl.endsWith('/latest-x64-win.yml'), true);
+  assert.equal(manifest.version, '2.35.2');
+  assert.equal(manifest.sha512, 'TEST_WIN_SHA512==');
+  assert.equal(manifest.url.endsWith('Antigravity-x64.exe'), true);
+
+  // Authenticode verifier checks Valid + Google LLC
+  withTempDir('hakimi-win-sig-', (dir) => {
+    const fakeExe = path.join(dir, 'Antigravity-x64.exe');
+    fs.writeFileSync(fakeExe, 'MZ');
+
+    const okRes = builder.verifyOfficialWindowsInstallerSignature(fakeExe, {
+      execFileSync: () => JSON.stringify({ Status: 'Valid', Subject: 'CN=Google LLC, O=Google LLC, C=US' }),
+    });
+    assert.equal(okRes.ok, true);
+
+    assert.throws(
+      () =>
+        builder.verifyOfficialWindowsInstallerSignature(fakeExe, {
+          execFileSync: () => JSON.stringify({ Status: 'NotSigned', Subject: '' }),
+        }),
+      /签名状态无效/
+    );
+
+    assert.throws(
+      () =>
+        builder.verifyOfficialWindowsInstallerSignature(fakeExe, {
+          execFileSync: () => JSON.stringify({ Status: 'Valid', Subject: 'CN=Evil Corp, O=Evil Corp' }),
+        }),
+      /不是 Google LLC/
+    );
+  });
+});
+
+test('Windows dual-source updater stages, verifies anti-lock detached runtime, and atomically cold-swaps with single-slot clean-base', async () => {
+  await withTempDirAsync('hakimi-win-updater-e2e-', async (dir) => {
+    const stateDir = path.join(dir, 'state');
+    const homeDir = path.join(dir, 'home');
+    const userDataDir = path.join(dir, 'AppData', 'Roaming', 'Antigravity');
+    const officialV2 = path.join(dir, 'OfficialV2');
+    const hakimiInstalled = path.join(dir, 'Programs', 'Hakimi');
+    const fake7zBin = path.join(dir, '7z.exe');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    fs.mkdirSync(homeDir, { recursive: true });
+    fs.writeFileSync(fake7zBin, 'FAKE_7Z');
+
+    // Create installed Hakimi v2.35.1 + clean official v2.35.2 source
+    createSyntheticWindowsApp(hakimiInstalled, { version: '2.35.1', integrityFuse: 0 });
+    createSyntheticWindowsApp(officialV2, { version: '2.35.2', integrityFuse: 0 });
+    const oldCommit = '1'.repeat(40);
+    builder.writeBuildMeta(hakimiInstalled, {
+      antigravityVersion: '2.35.1',
+      hakimiVersion: '1.0.0',
+      hakimiCommit: oldCommit,
+      githubOwner: 'zhangga',
+      githubRepo: 'antigravity-hakimi',
+      githubBranch: 'feat/windows-support',
+    });
+
+    // Seed old clean-base slot to confirm single-slot GC deletes it upon promotion
+    const paths = builder.getUpdaterPaths({ stateDir, homeDir, platform: 'win32' });
+    fs.mkdirSync(paths.cleanBaseDir, { recursive: true });
+    fs.writeFileSync(path.join(paths.cleanBaseDir, 'Antigravity-2.35.1.exe'), 'old-installer');
+
+    const fakeExePayload = Buffer.from('FAKE_WINDOWS_NSIS_INSTALLER_V2352');
+    const fakeExeSha512 = require('crypto').createHash('sha512').update(fakeExePayload).digest('base64');
+    const ymlV2 = [
+      'version: 2.35.2',
+      'files:',
+      '  - url: https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2/windows-x64/Antigravity-x64.exe',
+      `    sha512: ${fakeExeSha512}`,
+      `    size: ${fakeExePayload.length}`,
+      'path: Antigravity-x64.exe',
+      `sha512: ${fakeExeSha512}`,
+    ].join('\n');
+
+    const atomSameCommit = `<?xml version="1.0"?><feed><entry><id>tag:github.com,2008:Grit::Commit/${oldCommit}</id><title>current</title><updated>2026-11-26T00:00:00Z</updated></entry></feed>`;
+    let trackedGithubUrl = '';
+
+    const updater = updaterMod.createHakimiUpdater({
+      platform: 'win32',
+      arch: 'x64',
+      stateDir,
+      homeDir,
+      userDataDir,
+      targetAppPath: hakimiInstalled,
+      officialAppPath: path.join(dir, 'MissingOfficial'), // Force official-feed path
+      skipGoogleSignatureCheck: true,
+      skipOfficialRunningCheck: true,
+      httpRequest: async (url, reqOpts = {}) => {
+        if (url.includes('latest-x64-win.yml')) {
+          return { status: 200, text: ymlV2 };
+        }
+        if (url.includes('Antigravity-x64.exe') && reqOpts.destFilePath) {
+          fs.mkdirSync(path.dirname(reqOpts.destFilePath), { recursive: true });
+          fs.writeFileSync(reqOpts.destFilePath, fakeExePayload);
+          return { status: 200, filePath: reqOpts.destFilePath, sha512: fakeExeSha512 };
+        }
+        if (url.includes('github.com/zhangga/antigravity-hakimi/commits/feat%2Fwindows-support.atom')) {
+          trackedGithubUrl = url;
+          return { status: 200, text: atomSameCommit };
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      },
+      // Simulate extracting officialV2 contents into extractDir
+      execFileSync: (bin, args) => {
+        if (String(bin).toLowerCase().includes('7z') || String(bin).toLowerCase().includes('tar')) {
+          const outArg = args.find((a) => String(a).startsWith('-o'));
+          const cIdx = args.indexOf('-C');
+          const outDir = outArg ? outArg.slice(2) : cIdx >= 0 ? args[cIdx + 1] : '';
+          upgradeHelper.copyDirRecursiveSync(officialV2, outDir);
+          return '';
+        }
+        throw new Error(`Unexpected execFileSync: ${bin}`);
+      },
+      stageBuildImpl: (spec) => builder.stageBuildHakimiWinApp(spec),
+    });
+
+    // Use mock 7z bin so test runs deterministically even on machines without 7-Zip
+    const snap = await updater.checkAndStageUpgrade({ manual: true, sevenZipBin: fake7zBin });
+    assert.equal(snap.supported, true);
+    assert.equal(snap.status, 'ready', `Expected ready, got: ${JSON.stringify(snap)}`);
+    assert.equal(snap.staged.targetAntigravityVersion, '2.35.2');
+    assert.equal(snap.staged.antigravityChanged, true);
+    assert.ok(trackedGithubUrl.includes('zhangga/antigravity-hakimi'), 'should track repo from hakimi-build-meta.json');
+
+    // Verify installStagedUpgrade picks detached runtime OUTSIDE hakimiInstalled (anti-lock!)
+    const spawnedCalls = [];
+    const installRes = updater.installStagedUpgrade({
+      quitAfterHandoff: false,
+      spawnImpl: (bin, args, opts) => {
+        spawnedCalls.push({ bin, args, opts });
+        return { pid: 5555, unref() {} };
+      },
+    });
+    assert.equal(installRes.ok, true);
+    assert.equal(installRes.coldInstalling, true);
+    assert.equal(spawnedCalls.length, 1);
+    assert.equal(
+      path.resolve(spawnedCalls[0].bin).toLowerCase().startsWith(path.resolve(hakimiInstalled).toLowerCase()),
+      false,
+      'detached swap worker runtime MUST NOT live inside targetAppPath on Windows'
+    );
+    assert.equal(spawnedCalls[0].opts.windowsHide, true);
+
+    // Execute the actual job JSON written by installStagedUpgrade!
+    const jobArgIdx = spawnedCalls[0].args.indexOf('--job');
+    const jobPath = spawnedCalls[0].args[jobArgIdx + 1];
+    const jobData = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+    const relaunches = [];
+    let renameCalls = 0;
+    const coldRes = upgradeHelper.executeColdUpgradeJob(jobData, {
+      platform: 'win32',
+      findPidsImpl: () => [],
+      sleepImpl: () => {},
+      renameSync: (from, to) => {
+        renameCalls++;
+        if (renameCalls === 1) {
+          const e = new Error('transient NTFS lock');
+          e.code = 'EBUSY';
+          throw e;
+        }
+        fs.renameSync(from, to);
+      },
+      spawnImpl: (bin, args, opts) => {
+        relaunches.push({ bin, args, opts });
+        return { pid: 6666, unref() {} };
+      },
+    });
+
+    assert.equal(coldRes.ok, true, `Cold swap failed: ${JSON.stringify(coldRes)}`);
+    assert.equal(coldRes.swapped, true);
+    assert.equal(coldRes.cleanBasePromoted, true);
+    assert.equal(modulesConfig.readAppVersion(hakimiInstalled), '2.35.2');
+    assert.equal(fs.existsSync(path.join(paths.cleanBaseDir, 'Antigravity-2.35.2.exe')), true);
+    assert.equal(fs.existsSync(path.join(paths.cleanBaseDir, 'Antigravity-2.35.1.exe')), false);
+    assert.equal(relaunches.length, 1);
+    assert.equal(relaunches[0].bin, path.join(hakimiInstalled, 'Antigravity.exe'));
+  });
+});
+
+test('hakimi-upgrade-helper runs standalone outside repo on Windows with zero external deps', () => {
+  withTempDir('hakimi-standalone-upgrade-helper-', (dir) => {
+    const src = path.join(ROOT, 'payload', 'dist', 'hakimi-upgrade-helper.js');
+    const dst = path.join(dir, 'hakimi-upgrade-helper.js');
+    fs.copyFileSync(src, dst);
+    const mod = require(dst);
+    assert.equal(typeof mod.isWindowsAppPath, 'function');
+    assert.equal(typeof mod.renameWithRetrySync, 'function');
+    assert.equal(typeof mod.copyDirRecursiveSync, 'function');
+  });
+});
+
+test(
+  'live official cached Antigravity-x64.exe passes Google Authenticode and embedded 7z probe',
+  { skip: process.platform !== 'win32' },
+  () => {
+    const candidates = [
+      path.join(process.env.LOCALAPPDATA || '', 'antigravity-updater', 'pending', 'Antigravity-x64.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'antigravity-updater', 'installer.exe'),
+    ];
+    const cachedExe = candidates.find((p) => fs.existsSync(p));
+    if (!cachedExe) return;
+    const sig = builder.verifyOfficialWindowsInstallerSignature(cachedExe);
+    assert.equal(sig.ok, true);
+    assert.equal(sig.status, 'Valid');
+    const slice = builder.locateEmbedded7zSlice(cachedExe);
+    assert.ok(slice && slice.offset > 0 && slice.length > 1024 * 1024);
+  }
+);
+
+test('packPngFramesToIco and buildWindowsIconAssets produce valid multi-size ICO and PNG assets', { skip: process.platform !== 'win32' }, () => {
+  withTempDir('hakimi-win-ico-', (dir) => {
+    // 1. Verify ICO container structure from synthetic PNG frames
+    const fakePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+    const ico = buildWin.packPngFramesToIco([
+      { size: 256, png: fakePng },
+      { size: 48, png: fakePng },
+    ]);
+    assert.equal(ico.readUInt16LE(0), 0);
+    assert.equal(ico.readUInt16LE(2), 1); // ICO type
+    assert.equal(ico.readUInt16LE(4), 2); // 2 entries
+    assert.equal(ico.readUInt8(6), 0); // 256 encoded as 0
+    assert.equal(ico.readUInt8(22), 48); // 48px entry
+
+    // 2. Live PNG -> multi-size ICO conversion via Windows built-in System.Drawing
+    const samplePng = path.join(dir, 'sample.png');
+    // Minimal valid 1x1 red PNG
+    const red1x1Png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    fs.writeFileSync(samplePng, red1x1Png);
+    const outDir = path.join(dir, 'out');
+    const assets = buildWin.buildWindowsIconAssets(samplePng, outDir);
+    assert.equal(assets.format, 'converted');
+    assert.equal(fs.existsSync(assets.icoPath), true);
+    assert.equal(fs.existsSync(assets.pngPath), true);
+    const icoBuf = fs.readFileSync(assets.icoPath);
+    assert.equal(icoBuf.readUInt16LE(0), 0);
+    assert.equal(icoBuf.readUInt16LE(2), 1);
+    assert.equal(icoBuf.readUInt16LE(4), 3); // 256, 48, 32
+  });
+});
+
+
 

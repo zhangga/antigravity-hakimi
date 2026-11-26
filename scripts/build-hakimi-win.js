@@ -137,6 +137,30 @@ function getRepoGitCommit(repoRoot = ROOT) {
   }
 }
 
+function getRepoGithubRemoteInfo(repoRoot = ROOT) {
+  try {
+    const remoteUrl = execFileSync('git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    }).trim();
+    const branch = execFileSync('git', ['-C', repoRoot, 'branch', '--show-current'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    }).trim();
+    const m = remoteUrl.match(/github\.com[:/]([^/]+)\/([^/.]+?)(?:\.git)?$/i);
+    if (!m) return {};
+    return {
+      githubOwner: m[1],
+      githubRepo: m[2],
+      githubBranch: branch || 'main',
+    };
+  } catch {
+    return {};
+  }
+}
+
 function getRepoPackageVersion(repoRoot = ROOT) {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
@@ -346,11 +370,114 @@ function swapDirectoryWithRollback(stageDir, destDir, options = {}) {
   return { ok: true, swapped: true, hadExisting, cleanedPrev, prevBackup: cleanedPrev ? null : prevBackup };
 }
 
+function packPngFramesToIco(frames) {
+  // Standard Windows ICO container with embedded PNG frames (Vista/Win7/Win10/Win11)
+  // frames: Array<{ size: number, png: Buffer }>
+  if (!Array.isArray(frames) || frames.length === 0) {
+    throw new Error('ICO 帧列表为空');
+  }
+  const count = frames.length;
+  const header = Buffer.alloc(6 + count * 16);
+  header.writeUInt16LE(0, 0); // reserved
+  header.writeUInt16LE(1, 2); // type = 1 (ICO)
+  header.writeUInt16LE(count, 4);
+
+  let offset = header.length;
+  for (let i = 0; i < count; i++) {
+    const { size, png } = frames[i];
+    const dim = size >= 256 ? 0 : size & 0xff;
+    const base = 6 + i * 16;
+    header.writeUInt8(dim, base + 0); // width (0 means 256)
+    header.writeUInt8(dim, base + 1); // height (0 means 256)
+    header.writeUInt8(0, base + 2); // color count
+    header.writeUInt8(0, base + 3); // reserved
+    header.writeUInt16LE(1, base + 4); // color planes
+    header.writeUInt16LE(32, base + 6); // bits per pixel
+    header.writeUInt32LE(png.length, base + 8); // bytes in resource
+    header.writeUInt32LE(offset, base + 12); // offset
+    offset += png.length;
+  }
+  return Buffer.concat([header, ...frames.map((f) => f.png)]);
+}
+
+function buildWindowsIconAssets(iconInputPath, outDir, options = {}) {
+  const srcPath = path.resolve(String(iconInputPath || ''));
+  if (!fs.existsSync(srcPath) || !fs.statSync(srcPath).isFile()) {
+    throw new Error(`找不到自定义图标文件: ${srcPath}`);
+  }
+  fs.mkdirSync(outDir, { recursive: true });
+  const icoOutPath = path.join(outDir, 'hakimi.ico');
+  const pngOutPath = path.join(outDir, 'hakimi-icon-512.png');
+
+  const rawBuf = fs.readFileSync(srcPath);
+  const isIco = rawBuf.length >= 6 && rawBuf.readUInt16LE(0) === 0 && rawBuf.readUInt16LE(2) === 1;
+  if (isIco) {
+    fs.writeFileSync(icoOutPath, rawBuf);
+    return { icoPath: icoOutPath, pngPath: null, format: 'ico' };
+  }
+
+  const execImpl = options.execFileSync || execFileSync;
+  const esc = (s) => String(s).replace(/'/g, "''");
+  const psScript = [
+    "$ErrorActionPreference = 'Stop'",
+    'Add-Type -AssemblyName System.Drawing',
+    `$src = [System.Drawing.Image]::FromFile('${esc(srcPath)}')`,
+    'try {',
+    '  $side = [Math]::Min($src.Width, $src.Height)',
+    '  $sx = [int][Math]::Floor(($src.Width - $side) / 2)',
+    '  $sy = [int][Math]::Floor(($src.Height - $side) / 2)',
+    '  $cropRect = New-Object System.Drawing.Rectangle($sx, $sy, $side, $side)',
+    '  $out = @{}',
+    '  foreach ($sz in @(512, 256, 48, 32)) {',
+    '    $bmp = New-Object System.Drawing.Bitmap($sz, $sz)',
+    '    $g = [System.Drawing.Graphics]::FromImage($bmp)',
+    '    try {',
+    '      $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic',
+    '      $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality',
+    '      $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality',
+    '      $g.Clear([System.Drawing.Color]::Transparent)',
+    '      $dstRect = New-Object System.Drawing.Rectangle(0, 0, $sz, $sz)',
+    '      $g.DrawImage($src, $dstRect, $cropRect, [System.Drawing.GraphicsUnit]::Pixel)',
+    '    } finally { $g.Dispose() }',
+    '    $ms = New-Object System.IO.MemoryStream',
+    '    try {',
+    '      $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)',
+    '      $out[[string]$sz] = [Convert]::ToBase64String($ms.ToArray())',
+    '    } finally { $ms.Dispose(); $bmp.Dispose() }',
+    '  }',
+    '  $out | ConvertTo-Json -Compress',
+    '} finally { $src.Dispose() }',
+  ].join('\n');
+  const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+  const stdout = execImpl(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }
+  );
+  const parsed = JSON.parse(String(stdout || '').trim());
+  const png512 = Buffer.from(parsed['512'], 'base64');
+  const icoBuf = packPngFramesToIco([
+    { size: 256, png: Buffer.from(parsed['256'], 'base64') },
+    { size: 48, png: Buffer.from(parsed['48'], 'base64') },
+    { size: 32, png: Buffer.from(parsed['32'], 'base64') },
+  ]);
+  fs.writeFileSync(icoOutPath, icoBuf);
+  fs.writeFileSync(pngOutPath, png512);
+  return { icoPath: icoOutPath, pngPath: pngOutPath, format: 'converted' };
+}
+
 function createWindowsShortcuts(destDir, options = {}) {
   if ((options.platform || process.platform) !== 'win32') {
     return { created: [] };
   }
-  const exePath = path.join(path.resolve(destDir), 'Antigravity.exe');
+  const absDest = path.resolve(destDir);
+  const exePath = path.join(absDest, 'Antigravity.exe');
+  const customIco = path.join(absDest, 'resources', 'hakimi.ico');
+  const iconLocation = options.iconPath && fs.existsSync(options.iconPath)
+    ? `${path.resolve(options.iconPath)},0`
+    : fs.existsSync(customIco)
+      ? `${customIco},0`
+      : `${exePath},0`;
   const shortcutName = options.shortcutName || '哈基米.lnk';
   const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   const startMenuDir = path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs');
@@ -369,8 +496,8 @@ function createWindowsShortcuts(destDir, options = {}) {
     lines.push(
       `$s = $ws.CreateShortcut('${psEscape(lnk)}');`,
       `$s.TargetPath = '${psEscape(exePath)}';`,
-      `$s.WorkingDirectory = '${psEscape(path.resolve(destDir))}';`,
-      `$s.IconLocation = '${psEscape(exePath)},0';`,
+      `$s.WorkingDirectory = '${psEscape(absDest)}';`,
+      `$s.IconLocation = '${psEscape(iconLocation)}';`,
       `$s.Description = 'Antigravity Hakimi (Standalone)';`,
       '$s.Save();'
     );
@@ -385,7 +512,7 @@ function createWindowsShortcuts(destDir, options = {}) {
   } catch (err) {
     return { created, error: err?.message || String(err) };
   }
-  return { created };
+  return { created, iconLocation };
 }
 
 function buildCleanLaunchEnv(baseEnv = process.env) {
@@ -436,6 +563,7 @@ function buildHakimiWin(rawOpts = {}) {
   const antigravityVersion = modulesConfig.readAppVersion(srcDir) || 'unknown';
   const hakimiVersion = getRepoPackageVersion();
   const hakimiCommit = getRepoGitCommit();
+  const ghInfo = getRepoGithubRemoteInfo();
 
   // Stage on the same volume as destDir (when installing) or os.tmpdir() (when stageOnly)
   const stageParent = stageOnly ? os.tmpdir() : path.dirname(destDir);
@@ -466,17 +594,50 @@ function buildHakimiWin(rawOpts = {}) {
       });
     }
 
-    log('==> [3/5] 注入增强模块并重打包 resources\\app.asar');
+    // Optional custom icon (--icon <img|ico>) or carryover from existing Hakimi install
+    let iconPngForAsar = null;
+    let usingCustomIcon = false;
+    const stageIcoPath = path.join(stageDir, 'resources', 'hakimi.ico');
+    const iconTmpDir = path.join(stageDir, '.hakimi-icon-tmp');
+    try {
+      if (rawOpts.icon) {
+        log(`==> 处理自定义应用图标: ${rawOpts.icon}`);
+        const assets = buildWindowsIconAssets(rawOpts.icon, iconTmpDir);
+        fs.copyFileSync(assets.icoPath, stageIcoPath);
+        iconPngForAsar = assets.pngPath;
+        usingCustomIcon = true;
+      } else if (!rawOpts.restoreIcon && fs.existsSync(path.join(destDir, 'resources', 'hakimi.ico'))) {
+        fs.copyFileSync(path.join(destDir, 'resources', 'hakimi.ico'), stageIcoPath);
+        usingCustomIcon = true;
+        try {
+          const curAsar = path.join(destDir, 'resources', 'app.asar');
+          if (fs.existsSync(curAsar)) {
+            fs.mkdirSync(iconTmpDir, { recursive: true });
+            const carryPng = path.join(iconTmpDir, 'carry-icon.png');
+            fs.writeFileSync(carryPng, asarEngine.builtinAsar.extractFile(curAsar, 'icon.png'));
+            iconPngForAsar = carryPng;
+          }
+        } catch {}
+      }
+
+      log('==> [3/5] 注入增强模块并重打包 resources\\app.asar');
+      const stageAsar = path.join(stageDir, 'resources', 'app.asar');
+      var packRes = packHakimiAsar({
+        srcAsar,
+        destAsar: stageAsar,
+        stateDir: rawOpts.stateDir,
+        clientLang,
+        hasExplicitLang,
+        iconPng: iconPngForAsar,
+        forceConfig: Boolean(rawOpts.forceConfig),
+        skipConfig: stageOnly || Boolean(rawOpts.skipConfig),
+      });
+    } finally {
+      if (fs.existsSync(iconTmpDir)) {
+        try { fs.rmSync(iconTmpDir, { recursive: true, force: true }); } catch {}
+      }
+    }
     const stageAsar = path.join(stageDir, 'resources', 'app.asar');
-    const packRes = packHakimiAsar({
-      srcAsar,
-      destAsar: stageAsar,
-      stateDir: rawOpts.stateDir,
-      clientLang,
-      hasExplicitLang,
-      forceConfig: Boolean(rawOpts.forceConfig),
-      skipConfig: stageOnly || Boolean(rawOpts.skipConfig),
-    });
 
     const buildMeta = {
       schemaVersion: 1,
@@ -491,6 +652,7 @@ function buildHakimiWin(rawOpts = {}) {
       asarHeaderSha256: packRes.sha256,
       fuses: fuses.found ? fuses.flags : null,
       builtAt: new Date().toISOString(),
+      ...ghInfo,
     };
     fs.writeFileSync(
       path.join(stageDir, 'resources', 'hakimi-build-meta.json'),
@@ -589,6 +751,8 @@ function parseCliArgs(argv) {
     from: null,
     dest: null,
     stateDir: null,
+    icon: null,
+    restoreIcon: false,
     clientLang: 'zh-CN',
     hasExplicitLang: false,
     stageOnly: false,
@@ -609,6 +773,8 @@ function parseCliArgs(argv) {
     if (arg === '--from' && argv[i + 1]) opts.from = argv[++i];
     else if (arg === '--dest' && argv[i + 1]) opts.dest = argv[++i];
     else if (arg === '--state-dir' && argv[i + 1]) opts.stateDir = argv[++i];
+    else if (arg === '--icon' && argv[i + 1]) opts.icon = argv[++i];
+    else if (arg === '--restore-icon') opts.restoreIcon = true;
     else if (arg === '--client-lang' && argv[i + 1]) {
       opts.clientLang = argv[++i];
       opts.hasExplicitLang = true;
@@ -635,6 +801,8 @@ function printHelp() {
 Options:
   --from <dir>             只读官方 Antigravity 目录 (默认自动检测 %LOCALAPPDATA%\\Programs\\Antigravity)
   --dest <dir>             输出独立副本目录 (默认 %LOCALAPPDATA%\\Programs\\Hakimi)
+  --icon <file>            自定义应用图标（PNG/JPG/BMP/ICO），自动生成多尺寸 .ico 绑定快捷方式与窗口图标
+  --restore-icon           恢复使用官方默认图标（清除沿用的自定义图标）
   --stage-only             仅在临时沙盒构建与校验，不改动目标目录与运行中进程
   --keep-stage             配合 --stage-only 保留临时沙盒目录供检查
   --client-lang <lang>     客户端界面语言 (zh-CN | en，默认 zh-CN)
@@ -673,6 +841,8 @@ module.exports = {
   stopWinProcessesUnderRoot,
   renameWithRetry,
   swapDirectoryWithRollback,
+  packPngFramesToIco,
+  buildWindowsIconAssets,
   createWindowsShortcuts,
   buildCleanLaunchEnv,
   launchWinApp,

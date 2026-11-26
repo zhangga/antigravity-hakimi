@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build renderer bundle
+        run: npm run build:renderer
+      - name: Run Windows support & updater tests
+        run: node --test test/windows-support.test.js
+      - name: Run syntax, pruning, and zero-outbound-hook guards
+        run: node --test --test-name-pattern="EXCLUDED_SYMBOLS|prun|syntax|zero|payload" test/asar-and-pruning.test.js
+      - name: Run cross-platform updater tests
+        run: node --test --test-name-pattern="runs standalone|executeColdUpgradeJob|rolls back|sweeps tmp|wraps dist/updater|renderer shows" test/hakimi-updater.test.js
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run full macOS test suite
+        run: npm test

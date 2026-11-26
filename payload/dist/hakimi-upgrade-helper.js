@@ -210,10 +210,99 @@ function listPsProcesses(execImpl = execFileSync) {
   return rows;
 }
 
+function isWindowsAppPath(targetAppPath, platform = process.platform) {
+  if (!targetAppPath) return platform === 'win32';
+  const lower = String(targetAppPath).toLowerCase();
+  if (lower.endsWith('.app') || lower.endsWith('.app.orig')) return false;
+  return platform === 'win32';
+}
+
+function listWinProcesses(execImpl = execFileSync) {
+  const psScript = [
+    '$procs = Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine;',
+    'if ($procs) { $procs | ConvertTo-Json -Compress } else { "[]" }',
+  ].join(' ');
+  const out = execImpl(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 6000, windowsHide: true }
+  );
+  const trimmed = String(out || '').trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    const parsed = JSON.parse(trimmed);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    const rows = [];
+    for (const item of list) {
+      if (!item) continue;
+      const pid = Number(item.ProcessId);
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+      rows.push({
+        pid,
+        name: String(item.Name || ''),
+        executablePath: String(item.ExecutablePath || ''),
+        command: String(item.CommandLine || item.ExecutablePath || item.Name || ''),
+      });
+    }
+    return rows;
+  }
+  const rows = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const m = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    rows.push({ pid, name: '', executablePath: '', command: m[2] });
+  }
+  return rows;
+}
+
 function findRunningTargetPids(targetAppPath, mode = 'all', options = {}) {
   if (!targetAppPath) return [];
   const execImpl = options.execFileSync || execFileSync;
+  const plat = options.platform || process.platform;
   const resolvedApp = path.resolve(String(targetAppPath));
+  const selfPids = new Set([process.pid, ...(Array.isArray(options.excludePids) ? options.excludePids : [])]);
+
+  if (isWindowsAppPath(targetAppPath, plat)) {
+    let normRoot = resolvedApp;
+    try {
+      if (fs.existsSync(resolvedApp)) normRoot = fs.realpathSync(resolvedApp);
+    } catch {}
+    const prefixes = new Set([
+      resolvedApp.replace(/[\\/]+$/, '').toLowerCase() + '\\',
+      normRoot.replace(/[\\/]+$/, '').toLowerCase() + '\\',
+    ]);
+    const mainExecs = new Set([
+      path.join(resolvedApp, 'Antigravity.exe').toLowerCase(),
+      path.join(normRoot, 'Antigravity.exe').toLowerCase(),
+    ]);
+    let rows = [];
+    try {
+      rows = listWinProcesses(execImpl);
+    } catch {
+      return [];
+    }
+    const pids = [];
+    for (const row of rows) {
+      if (selfPids.has(row.pid)) continue;
+      const exeLower = row.executablePath ? path.resolve(row.executablePath).toLowerCase() : '';
+      if (!exeLower) continue;
+      const isMain = mainExecs.has(exeLower);
+      let isUnderApp = false;
+      for (const pref of prefixes) {
+        if (exeLower.startsWith(pref)) {
+          isUnderApp = true;
+          break;
+        }
+      }
+      if (mode === 'main' ? isMain : (isMain || isUnderApp)) {
+        pids.push(row.pid);
+      }
+    }
+    return pids;
+  }
+
   const prefixes = new Set([resolvedApp.replace(/\/+$/, '') + '/']);
   const execs = new Set([path.join(resolvedApp, 'Contents', 'MacOS', 'Antigravity')]);
   try {
@@ -226,7 +315,6 @@ function findRunningTargetPids(targetAppPath, mode = 'all', options = {}) {
     execs.add(realExec);
   } catch {}
 
-  const selfPids = new Set([process.pid, ...(Array.isArray(options.excludePids) ? options.excludePids : [])]);
   let rows = [];
   try {
     rows = listPsProcesses(execImpl);
@@ -292,8 +380,10 @@ function stopTargetAppProcesses(targetAppPath, options = {}) {
   const allTermMs = Number.isFinite(options.allTermMs) ? options.allTermMs : 1500;
   const killWaitMs = Number.isFinite(options.killWaitMs) ? options.killWaitMs : 2500;
   const killImpl = options.killImpl || process.kill;
+  const execImpl = options.execFileSync || execFileSync;
   const sleepImpl = options.sleepImpl || sleepMs;
   const findPids = options.findPidsImpl || ((m) => findRunningTargetPids(targetAppPath, m, options));
+  const isWinTarget = isWindowsAppPath(targetAppPath, options.platform || process.platform);
 
   const waitUntilZero = (budgetMs) => {
     const steps = Math.max(1, Math.ceil(budgetMs / Math.max(10, pollIntervalMs)));
@@ -313,21 +403,55 @@ function stopTargetAppProcesses(targetAppPath, options = {}) {
 
   const mainPids = findPids('main');
   if (mainPids.length > 0) {
-    for (const pid of mainPids) safeKillPid(pid, 'SIGTERM', killImpl);
+    if (isWinTarget && !options.killImpl) {
+      const pidCsv = mainPids.join(',');
+      try {
+        execImpl(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            `Get-Process -Id ${pidCsv} -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }`,
+          ],
+          { stdio: 'ignore', timeout: 4000, windowsHide: true }
+        );
+      } catch {}
+    } else {
+      for (const pid of mainPids) safeKillPid(pid, 'SIGTERM', killImpl);
+    }
     rem = waitUntilZero(mainTermMs);
     if (rem.length === 0) return { ok: true, remaining: [] };
   }
 
-  for (const pid of rem) safeKillPid(pid, 'SIGTERM', killImpl);
-  rem = waitUntilZero(allTermMs);
-  if (rem.length === 0) return { ok: true, remaining: [] };
-
-  const killSteps = Math.max(1, Math.ceil(killWaitMs / Math.max(10, pollIntervalMs)));
-  for (let i = 0; i < killSteps; i++) {
-    rem = findPids('all');
+  if (isWinTarget && !options.killImpl) {
+    for (const pid of rem) {
+      try {
+        execImpl('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+          stdio: 'ignore',
+          timeout: 4000,
+          windowsHide: true,
+        });
+      } catch {
+        safeKillPid(pid, 'SIGKILL', killImpl);
+      }
+    }
+    rem = waitUntilZero(allTermMs + killWaitMs);
     if (rem.length === 0) return { ok: true, remaining: [] };
-    for (const pid of rem) safeKillPid(pid, 'SIGKILL', killImpl);
-    sleepImpl(pollIntervalMs);
+  } else {
+    for (const pid of rem) safeKillPid(pid, 'SIGTERM', killImpl);
+    rem = waitUntilZero(allTermMs);
+    if (rem.length === 0) return { ok: true, remaining: [] };
+
+    const killSteps = Math.max(1, Math.ceil(killWaitMs / Math.max(10, pollIntervalMs)));
+    for (let i = 0; i < killSteps; i++) {
+      rem = findPids('all');
+      if (rem.length === 0) return { ok: true, remaining: [] };
+      for (const pid of rem) safeKillPid(pid, 'SIGKILL', killImpl);
+      sleepImpl(pollIntervalMs);
+    }
   }
 
   rem = findPids('all');
@@ -348,6 +472,19 @@ function cleanupStaleSingletonLockDir(userDataDir, killImpl = process.kill) {
   try {
     st = fs.lstatSync(lockPath);
   } catch {
+    if (process.platform === 'win32') {
+      const winLockPath = path.join(dir, 'lockfile');
+      if (!fs.existsSync(winLockPath)) return { cleaned: false, reason: 'no_lock', dir };
+      try {
+        fs.unlinkSync(winLockPath);
+        return { cleaned: true, pid: null, dir };
+      } catch (err) {
+        if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+          return { cleaned: false, reason: 'owner_alive', dir };
+        }
+        return { cleaned: false, reason: 'unreadable_lock', dir };
+      }
+    }
     return { cleaned: false, reason: 'no_lock', dir };
   }
   if (!st || !st.isSymbolicLink()) {
@@ -429,7 +566,23 @@ function relaunchTargetApp(targetAppPath, options = {}) {
   if (!targetAppPath) return { ok: false, error: '未指定要重新启动的应用路径' };
   const spawnImpl = options.spawnImpl || spawn;
   const cleanEnv = buildCleanRelaunchEnv(options.env || process.env);
+  const plat = options.platform || process.platform;
   try {
+    if (isWindowsAppPath(targetAppPath, plat)) {
+      const resolved = path.resolve(String(targetAppPath));
+      const exePath = resolved.toLowerCase().endsWith('.exe')
+        ? resolved
+        : path.join(resolved, 'Antigravity.exe');
+      const child = spawnImpl(exePath, [], {
+        cwd: path.dirname(exePath),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        env: cleanEnv,
+      });
+      if (child && typeof child.unref === 'function') child.unref();
+      return { ok: true, exePath };
+    }
     const child = spawnImpl('/usr/bin/open', ['-n', targetAppPath], {
       detached: true,
       stdio: 'ignore',
@@ -442,15 +595,24 @@ function relaunchTargetApp(targetAppPath, options = {}) {
   }
 }
 
-function verifyStagedBundleReady(stagedAppPath) {
+function verifyStagedBundleReady(stagedAppPath, options = {}) {
   if (!stagedAppPath || !fs.existsSync(stagedAppPath)) {
     throw new Error(`找不到已准备好的更新包: ${stagedAppPath || '(空)'}`);
   }
-  const required = [
-    path.join(stagedAppPath, 'Contents', 'Info.plist'),
-    path.join(stagedAppPath, 'Contents', 'MacOS', 'Antigravity'),
-    path.join(stagedAppPath, 'Contents', 'Resources', 'app.asar'),
-  ];
+  const isWin =
+    !String(stagedAppPath).toLowerCase().endsWith('.app') &&
+    ((options.platform || process.platform) === 'win32' ||
+      fs.existsSync(path.join(stagedAppPath, 'Antigravity.exe')));
+  const required = isWin
+    ? [
+        path.join(stagedAppPath, 'Antigravity.exe'),
+        path.join(stagedAppPath, 'resources', 'app.asar'),
+      ]
+    : [
+        path.join(stagedAppPath, 'Contents', 'Info.plist'),
+        path.join(stagedAppPath, 'Contents', 'MacOS', 'Antigravity'),
+        path.join(stagedAppPath, 'Contents', 'Resources', 'app.asar'),
+      ];
   for (const reqPath of required) {
     if (!fs.existsSync(reqPath)) {
       throw new Error(`更新包结构不完整，缺少 ${path.relative(stagedAppPath, reqPath)}`);
@@ -458,7 +620,54 @@ function verifyStagedBundleReady(stagedAppPath) {
   }
 }
 
-function moveBundleSameVolumeSafe(srcPath, destPath, { execImpl = execFileSync, renameImpl = fs.renameSync } = {}) {
+function copyDirRecursiveSync(srcDir, destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursiveSync(srcPath, destPath);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(srcPath, destPath);
+    } else if (entry.isSymbolicLink()) {
+      try {
+        fs.symlinkSync(fs.readlinkSync(srcPath), destPath);
+      } catch {
+        const st = fs.statSync(srcPath);
+        if (st.isDirectory()) copyDirRecursiveSync(srcPath, destPath);
+        else if (st.isFile()) fs.copyFileSync(srcPath, destPath);
+      }
+    }
+  }
+}
+
+function copyBundleCrossVolume(srcPath, destPath, { execImpl = execFileSync, platform = process.platform } = {}) {
+  if (platform === 'win32' || isWindowsAppPath(destPath, platform)) {
+    copyDirRecursiveSync(srcPath, destPath);
+    return;
+  }
+  execImpl('/usr/bin/ditto', [srcPath, destPath], { stdio: 'pipe' });
+}
+
+function renameWithRetrySync(fromPath, toPath, { renameImpl = fs.renameSync, sleepImpl = sleepMs, maxWaitMs = 10000 } = {}) {
+  const start = Date.now();
+  let delay = 150;
+  while (true) {
+    try {
+      renameImpl(fromPath, toPath);
+      return;
+    } catch (err) {
+      const retryable = err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES');
+      if (!retryable || Date.now() - start >= maxWaitMs) {
+        throw err;
+      }
+      sleepImpl(delay);
+      delay = Math.min(1000, Math.round(delay * 1.5));
+    }
+  }
+}
+
+function moveBundleSameVolumeSafe(srcPath, destPath, { execImpl = execFileSync, renameImpl = fs.renameSync, platform = process.platform } = {}) {
   assertNotOfficialBundle(srcPath, '移动源包');
   assertNotOfficialBundle(destPath, '覆盖目标包');
   try {
@@ -468,16 +677,28 @@ function moveBundleSameVolumeSafe(srcPath, destPath, { execImpl = execFileSync, 
     if (!err || err.code !== 'EXDEV') throw err;
   }
   // Cross-device fallback: copy into sibling incoming path first, then caller renames atomically
-  execImpl('/usr/bin/ditto', [srcPath, destPath], { stdio: 'pipe' });
+  copyBundleCrossVolume(srcPath, destPath, { execImpl, platform });
   rmDirSafe(srcPath);
 }
 
 /**
- * Atomic same-volume bundle swap with automatic `.prev` rollback on any failure.
+ * Atomic same-volume bundle swap with NTFS lock retry & automatic `.prev` rollback on any failure.
  */
 function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPath }, options = {}) {
   const execImpl = options.execFileSync || execFileSync;
-  const renameImpl = options.renameSync || fs.renameSync;
+  const rawRenameImpl = options.renameSync || fs.renameSync;
+  const sleepImpl = options.sleepImpl || sleepMs;
+  const plat = options.platform || process.platform;
+  const isWin = isWindowsAppPath(targetAppPath, plat);
+  const renameImpl = isWin
+    ? (from, to) =>
+        renameWithRetrySync(from, to, {
+          renameImpl: rawRenameImpl,
+          sleepImpl,
+          maxWaitMs: Number.isFinite(options.renameMaxWaitMs) ? options.renameMaxWaitMs : 10000,
+        })
+    : rawRenameImpl;
+
   const targetAbs = path.resolve(String(targetAppPath || ''));
   const stagedAbs = path.resolve(String(stagedAppPath || ''));
   const targetDir = path.dirname(targetAbs);
@@ -492,7 +713,7 @@ function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPa
   assertNotOfficialBundle(prevAbs, '创建旧版备份');
   assertNotOfficialBundle(incomingAbs, '准备同盘暂存目录');
 
-  verifyStagedBundleReady(stagedAbs);
+  verifyStagedBundleReady(stagedAbs, { platform: plat });
 
   if (fs.existsSync(prevAbs)) rmDirSafe(prevAbs);
   if (fs.existsSync(incomingAbs)) rmDirSafe(incomingAbs);
@@ -503,7 +724,7 @@ function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPa
     const targetDirStat = fs.statSync(targetDir);
     const stagedStat = fs.statSync(stagedAbs);
     if (targetDirStat.dev !== stagedStat.dev) {
-      execImpl('/usr/bin/ditto', [stagedAbs, incomingAbs], { stdio: 'pipe' });
+      copyBundleCrossVolume(stagedAbs, incomingAbs, { execImpl, platform: plat });
       readyToRenamePath = incomingAbs;
     }
   } catch {
@@ -521,12 +742,11 @@ function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPa
       renameImpl(readyToRenamePath, targetAbs);
     } catch (renameErr) {
       if (renameErr && renameErr.code === 'EXDEV' && readyToRenamePath !== incomingAbs) {
-        // Restore target before cross-device copy if possible, or copy to incoming then swap
         if (movedTargetToPrev && fs.existsSync(prevAbs) && !fs.existsSync(targetAbs)) {
           renameImpl(prevAbs, targetAbs);
           movedTargetToPrev = false;
         }
-        execImpl('/usr/bin/ditto', [stagedAbs, incomingAbs], { stdio: 'pipe' });
+        copyBundleCrossVolume(stagedAbs, incomingAbs, { execImpl, platform: plat });
         readyToRenamePath = incomingAbs;
         if (hadExistingTarget) {
           renameImpl(targetAbs, prevAbs);
@@ -553,9 +773,17 @@ function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPa
     throw err;
   }
 
-  // Success: immediately remove `.prev` backup and any leftover incoming dir
+  // Success: immediately remove `.prev` backup and any leftover incoming dir (best-effort retry on NTFS)
+  let cleanedPrev = false;
   if (movedTargetToPrev && fs.existsSync(prevAbs)) {
-    rmDirSafe(prevAbs);
+    try {
+      fs.rmSync(prevAbs, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      cleanedPrev = !fs.existsSync(prevAbs);
+    } catch {
+      cleanedPrev = false;
+    }
+  } else {
+    cleanedPrev = movedTargetToPrev;
   }
   if (fs.existsSync(incomingAbs)) {
     rmDirSafe(incomingAbs);
@@ -578,12 +806,12 @@ function swapStagedBundleAtomically({ targetAppPath, stagedAppPath, prevBackupPa
     } catch {}
   }
 
-  return { ok: true, targetAppPath: targetAbs, cleanedPrev: movedTargetToPrev };
+  return { ok: true, targetAppPath: targetAbs, cleanedPrev };
 }
 
 /**
- * Promote newly verified clean official zip into the single-slot cache directory
- * and delete all older/duplicate zip files immediately.
+ * Promote newly verified clean official package (.zip on macOS, .exe on Windows)
+ * into the single-slot cache directory and delete all older/duplicate copies immediately.
  */
 function promoteSingleSlotCleanBase(promotion, options = {}) {
   if (!promotion || !promotion.stagedZipPath || !promotion.cleanBaseDir || !promotion.version) {
@@ -595,7 +823,8 @@ function promoteSingleSlotCleanBase(promotion, options = {}) {
   if (!version || !fs.existsSync(stagedZip)) return { promoted: false };
 
   fs.mkdirSync(cleanBaseDir, { recursive: true });
-  const targetFileName = `Antigravity-${version}.zip`;
+  const ext = stagedZip.toLowerCase().endsWith('.exe') ? '.exe' : '.zip';
+  const targetFileName = `Antigravity-${version}${ext}`;
   const targetZip = path.join(cleanBaseDir, targetFileName);
   const metaPath = path.join(cleanBaseDir, 'clean-base-meta.json');
 
@@ -623,11 +852,11 @@ function promoteSingleSlotCleanBase(promotion, options = {}) {
     0o600
   );
 
-  // Enforce strict single-slot invariant: remove any older/other *.zip in cleanBaseDir
+  // Enforce strict single-slot invariant: remove any older/other *.zip or *.exe in cleanBaseDir
   const removedOld = [];
   try {
     for (const entry of fs.readdirSync(cleanBaseDir)) {
-      if (entry.endsWith('.zip') && entry !== targetFileName) {
+      if ((entry.endsWith('.zip') || entry.endsWith('.exe')) && entry !== targetFileName) {
         if (unlinkIfExists(path.join(cleanBaseDir, entry))) {
           removedOld.push(entry);
         }
@@ -635,15 +864,27 @@ function promoteSingleSlotCleanBase(promotion, options = {}) {
     }
   } catch {}
 
-  // Also clean duplicate native pending cache zip when official Antigravity.app is not running
+  // Also clean duplicate native pending cache when official Antigravity is not running
   const nativeCacheDir = promotion.nativeCacheDir ? path.resolve(String(promotion.nativeCacheDir)) : '';
   if (nativeCacheDir && fs.existsSync(nativeCacheDir)) {
+    const plat = options.platform || process.platform;
+    const isWin = ext === '.exe' || (plat === 'win32' && ext !== '.zip');
+    const officialRoot = isWin
+      ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'Antigravity')
+      : '/Applications/Antigravity.app';
     const officialRunning =
-      findRunningTargetPids('/Applications/Antigravity.app', 'all', options).length > 0;
+      findRunningTargetPids(officialRoot, 'all', { ...options, platform: plat }).length > 0;
     if (!officialRunning) {
-      unlinkIfExists(path.join(nativeCacheDir, 'pending', 'Antigravity.zip'));
-      unlinkIfExists(path.join(nativeCacheDir, 'pending', 'update-info.json'));
-      unlinkIfExists(path.join(nativeCacheDir, 'update.zip'));
+      if (isWin) {
+        const pendingInfo = readJsonFileSafe(path.join(nativeCacheDir, 'pending', 'update-info.json'), null);
+        const pendingFile = pendingInfo?.data?.fileName || 'Antigravity-x64.exe';
+        unlinkIfExists(path.join(nativeCacheDir, 'pending', pendingFile));
+        unlinkIfExists(path.join(nativeCacheDir, 'pending', 'update-info.json'));
+      } else {
+        unlinkIfExists(path.join(nativeCacheDir, 'pending', 'Antigravity.zip'));
+        unlinkIfExists(path.join(nativeCacheDir, 'pending', 'update-info.json'));
+        unlinkIfExists(path.join(nativeCacheDir, 'update.zip'));
+      }
     }
   }
 
@@ -814,6 +1055,8 @@ module.exports = {
   writeJsonFileAtomic,
   unlinkIfExists,
   rmDirSafe,
+  isWindowsAppPath,
+  listWinProcesses,
   findRunningTargetPids,
   stopTargetAppProcesses,
   cleanupStaleSingletonLockDir,
@@ -822,6 +1065,8 @@ module.exports = {
   buildCleanRelaunchEnv,
   relaunchTargetApp,
   verifyStagedBundleReady,
+  copyDirRecursiveSync,
+  renameWithRetrySync,
   moveBundleSameVolumeSafe,
   swapStagedBundleAtomically,
   promoteSingleSlotCleanBase,

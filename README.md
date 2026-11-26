@@ -73,7 +73,36 @@ npm run unlock:cli
 npm run doctor
 ```
 
-### 2. 在 Linux 开发机解锁 `agy` CLI（支持 `x86-64` / `arm64`）
+### 2. Windows 10 / 11 独立版构建、多账号冷切与自动更新
+
+Windows 下默认只读读取本机官方 `%LOCALAPPDATA%\Programs\Antigravity`（严禁修改官方原版），在同级构建独立客户端 **`%LOCALAPPDATA%\Programs\Hakimi`** 并创建开始菜单/桌面 **`哈基米`** 快捷方式（要求 Node.js `>= 22.4.0`）：
+
+```powershell
+# 一键构建、安装并启动独立版（保留官方原版纯净隔离）
+.\build-hakimi.ps1
+
+# 仅在临时沙盒试构建与校验（不动已安装目录与运行中进程）
+.\build-hakimi.ps1 --stage-only
+
+# 指定自定义图标（PNG/JPG/BMP/ICO，自动生成多尺寸 .ico 绑定快捷方式与窗口图标，不破坏主程序签名）
+.\build-hakimi.ps1 --icon C:\path\to\hakimi.png
+
+# 构建但不自动启动 / 恢复官方默认图标
+.\build-hakimi.ps1 --no-restart
+.\build-hakimi.ps1 --restore-icon
+
+# 只读健康诊断（官方纯净隔离、Electron Fuse、ASAR 模块、版本同步与运行进程）
+npm run doctor
+
+# 终端管理多账号（Windows 凭据管理器原生 Vault，零明文落盘，亦可在桌面左下角浮层操作）
+npm run accounts -- status
+npm run accounts -- save --label "主力号"
+npm run accounts -- switch <email>
+```
+
+- **Windows 完整双源静默自动升级**：应用内自动监测官方 `latest-x64-win.yml` 与 GitHub 仓库提交；拉取官方 NSIS 安装包后强制校验 `SHA-512` 与 `CN=Google LLC` Authenticode 签名，优先使用 7-Zip、无 7-Zip 时自动按 7z 头部切片调用 Windows 原生 `tar.exe` 零依赖拆包，沙盒校验通过后经独立脱离式 Worker（避开目录占用锁 + NTFS 重试与 `.prev` 自动回滚）原子替换并重启。
+
+### 3. 在 Linux 开发机解锁 `agy` CLI（支持 `x86-64` / `arm64`）
 
 Linux 环境无需 macOS `codesign` 或桌面端应用，自动探测 `~/.local/bin/agy`、`~/.antigravity/antigravity/bin/agy`、`$PATH`（或通过 `--binary` / `AGY_CLI_BIN` 指定）：
 

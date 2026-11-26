@@ -78,6 +78,10 @@ function resolveCurrentBundlePath(options = {}) {
   return fallback;
 }
 
+function isSupportedPlatform(platform = process.platform) {
+  return platform === 'darwin' || platform === 'win32';
+}
+
 function resolveWorkerRuntime(options = {}) {
   if (options.nodeBin) {
     return { bin: String(options.nodeBin), envExtra: options.nodeEnvExtra || {} };
@@ -93,6 +97,73 @@ function resolveWorkerRuntime(options = {}) {
   return {
     bin: options.execPath || process.execPath,
     envExtra: {},
+  };
+}
+
+/**
+ * Resolve runtime binary for the detached cold-swap worker (`hakimi-upgrade-helper.js`).
+ * On Windows NTFS, the swap worker MUST NOT run from inside `targetAppPath` (otherwise
+ * Windows locks `targetAppPath\Antigravity.exe` and blocks `renameSync(target, .prev)`).
+ */
+function resolveDetachedSwapRuntime(options = {}, targetAppPath = '') {
+  if (options.nodeBin) {
+    return { bin: String(options.nodeBin), envExtra: options.nodeEnvExtra || {} };
+  }
+  const plat = options.platform || process.platform;
+  if (plat !== 'win32') {
+    return resolveWorkerRuntime(options);
+  }
+  const targetPrefix = targetAppPath
+    ? path.resolve(String(targetAppPath)).replace(/[\\/]+$/, '').toLowerCase() + '\\'
+    : '';
+  const isInsideTarget = (p) => Boolean(targetPrefix && path.resolve(String(p)).toLowerCase().startsWith(targetPrefix));
+
+  // 1. Prefer system node.exe outside targetAppPath
+  const nodeCandidates = [];
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (dir) nodeCandidates.push(path.join(dir, 'node.exe'));
+  }
+  if (process.env.ProgramFiles) {
+    nodeCandidates.push(path.join(process.env.ProgramFiles, 'nodejs', 'node.exe'));
+  }
+  for (const cand of nodeCandidates) {
+    try {
+      if (!isInsideTarget(cand) && fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+        return { bin: cand, envExtra: {} };
+      }
+    } catch {}
+  }
+
+  // 2. Fallback: execute read-only official Antigravity.exe with ELECTRON_RUN_AS_NODE=1
+  // (strictly read-only execution outside Hakimi & stageDir; never mutates official install)
+  try {
+    const officialDir = asarEngine.getDefaultOfficialAppPath('win32');
+    const officialExe = path.join(officialDir, 'Antigravity.exe');
+    if (!isInsideTarget(officialExe) && fs.existsSync(officialExe)) {
+      return { bin: officialExe, envExtra: { ELECTRON_RUN_AS_NODE: '1' } };
+    }
+  } catch {}
+
+  return resolveWorkerRuntime(options);
+}
+
+function resolveGithubTrackingConfig(opts = {}, installed = null) {
+  return {
+    githubOwner:
+      opts.githubOwner ||
+      process.env.HAKIMI_GITHUB_OWNER ||
+      installed?.githubOwner ||
+      builder.GITHUB_OWNER,
+    githubRepo:
+      opts.githubRepo ||
+      process.env.HAKIMI_GITHUB_REPO ||
+      installed?.githubRepo ||
+      builder.GITHUB_REPO,
+    githubBranch:
+      opts.githubBranch ||
+      process.env.HAKIMI_GITHUB_BRANCH ||
+      installed?.githubBranch ||
+      builder.GITHUB_BRANCH,
   };
 }
 
@@ -121,6 +192,7 @@ function runStageBuildInChildWorker(spec, options = {}) {
       [workerScript, 'stage-build', '--spec', specPath, '--result-out', resultPath],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
         env: { ...process.env, ...runtime.envExtra },
       }
     );
@@ -213,7 +285,7 @@ function createHakimiUpdater(defaultOptions = {}) {
 
   function buildStatusSnapshot(override = {}) {
     const opts = getOpts(override);
-    const supported = (opts.platform || process.platform) === 'darwin';
+    const supported = isSupportedPlatform(opts.platform || process.platform);
     const paths = builder.getUpdaterPaths(opts);
     let targetAppPath = '';
     try {
@@ -340,17 +412,24 @@ function createHakimiUpdater(defaultOptions = {}) {
     ephemeralTmpDir,
     opts,
   }) {
-    const paths = builder.getUpdaterPaths(opts);
+    const plat = opts.platform || process.platform;
+    const isWin = plat === 'win32';
+    const paths = builder.getUpdaterPaths({ ...opts, platform: plat });
 
-    // 1. Check read-only local official /Applications/Antigravity.app (or custom officialAppPath)
+    // 1. Check read-only local official installation (macOS /Applications/Antigravity.app or Windows Programs\Antigravity)
     const officialCandidates = opts.officialAppPath
       ? [path.resolve(String(opts.officialAppPath))]
-      : ['/Applications/Antigravity.app.orig', '/Applications/Antigravity.app'];
+      : isWin
+        ? [asarEngine.getDefaultOfficialAppPath('win32')]
+        : ['/Applications/Antigravity.app.orig', '/Applications/Antigravity.app'];
+    const modulesConfig = require('./modules-config');
     for (const cand of officialCandidates) {
       if (!fs.existsSync(cand)) continue;
-      const ver = builder.readBundleShortVersion(path.join(cand, 'Contents', 'Info.plist'));
+      const ver = isWin
+        ? modulesConfig.readAppVersion(cand)
+        : builder.readBundleShortVersion(path.join(cand, 'Contents', 'Info.plist'));
       if (ver && ver === targetAgVer) {
-        if (opts.skipGoogleSignatureCheck !== true && process.platform === 'darwin') {
+        if (!isWin && opts.skipGoogleSignatureCheck !== true && process.platform === 'darwin') {
           try {
             builder.verifyOfficialGoogleBundleSignature(cand, opts);
           } catch {
@@ -366,11 +445,14 @@ function createHakimiUpdater(defaultOptions = {}) {
       }
     }
 
-    // 2. Check single-slot clean-base cache zip matching `targetAgVer`
+    // 2. Check single-slot clean-base cache matching `targetAgVer`
     const cleanMeta = builder.readCleanBaseMeta(paths.cleanBaseDir);
     if (cleanMeta && cleanMeta.version === targetAgVer && fs.existsSync(cleanMeta.zipPath)) {
       const extractDir = path.join(ephemeralTmpDir, `official-${targetAgVer}`);
-      const extractedApp = builder.extractOfficialZipAndVerify(cleanMeta.zipPath, extractDir, opts);
+      const extractedApp = builder.extractOfficialZipAndVerify(cleanMeta.zipPath, extractDir, {
+        ...opts,
+        platform: plat,
+      });
       return {
         sourceAppPath: extractedApp,
         downloadedZipPath: null,
@@ -379,13 +461,14 @@ function createHakimiUpdater(defaultOptions = {}) {
       };
     }
 
-    // 3. Acquire from official feed manifest (reuses verified pending zip or downloads over HTTPS)
+    // 3. Acquire from official feed manifest (reuses verified pending cache or downloads over HTTPS)
     if (officialManifest && officialManifest.version === targetAgVer) {
       let downloadManifest = officialManifest;
       if (!downloadManifest.url || !downloadManifest.sha512) {
         try {
           const fullManifest = await builder.fetchOfficialLatestManifest({
             ...opts,
+            platform: plat,
             appBundlePath: targetAppPath || opts.targetAppPath,
             currentVersion: undefined,
             requireDownload: true,
@@ -396,14 +479,21 @@ function createHakimiUpdater(defaultOptions = {}) {
         } catch {}
       }
       if (downloadManifest.url && downloadManifest.sha512) {
-        const tmpZipPath = path.join(ephemeralTmpDir, `Antigravity-${targetAgVer}.zip`);
-        const acquired = await builder.acquireOfficialVerifiedZip(downloadManifest, tmpZipPath, opts);
+        const pkgExt = isWin ? '.exe' : '.zip';
+        const tmpPkgPath = path.join(ephemeralTmpDir, `Antigravity-${targetAgVer}${pkgExt}`);
+        const acquired = await builder.acquireOfficialVerifiedZip(downloadManifest, tmpPkgPath, {
+          ...opts,
+          platform: plat,
+        });
         const extractDir = path.join(ephemeralTmpDir, `official-${targetAgVer}`);
-        const extractedApp = builder.extractOfficialZipAndVerify(acquired.zipPath, extractDir, opts);
-        const isEphemeralZip = path.resolve(acquired.zipPath) === path.resolve(tmpZipPath);
+        const extractedApp = builder.extractOfficialZipAndVerify(acquired.zipPath, extractDir, {
+          ...opts,
+          platform: plat,
+        });
+        const isEphemeralPkg = path.resolve(acquired.zipPath) === path.resolve(tmpPkgPath);
         return {
           sourceAppPath: extractedApp,
-          downloadedZipPath: isEphemeralZip ? acquired.zipPath : null,
+          downloadedZipPath: isEphemeralPkg ? acquired.zipPath : null,
           sha512: acquired.sha512,
           sourceKind: 'official-feed',
         };
@@ -448,6 +538,7 @@ function createHakimiUpdater(defaultOptions = {}) {
     const stageId = `build-${targetAgVer}-${String(targetHakimiSha || 'local').slice(0, 7)}-${Date.now()}`;
     const stageDir = path.join(paths.stagingDir, stageId);
 
+    const ghCfg = resolveGithubTrackingConfig(opts, installed);
     const buildRes = await runStageBuildInChildWorker(
       {
         sourceAppPath: officialSrc.sourceAppPath,
@@ -460,6 +551,7 @@ function createHakimiUpdater(defaultOptions = {}) {
         gitDirty: false,
         sourceKind: officialSrc.sourceKind,
         preserveCustomIcon: true,
+        ...ghCfg,
       },
       opts
     );
@@ -473,10 +565,11 @@ function createHakimiUpdater(defaultOptions = {}) {
       };
     }
 
-    // Move newly downloaded official zip into stageDir for atomic single-slot promotion on swap
+    // Move newly downloaded official package into stageDir for atomic single-slot promotion on swap
     let cleanBasePromotion = null;
     if (officialSrc.downloadedZipPath && fs.existsSync(officialSrc.downloadedZipPath)) {
-      const stagedZipPath = path.join(stageDir, `clean-base-${targetAgVer}.zip`);
+      const pkgExt = officialSrc.downloadedZipPath.toLowerCase().endsWith('.exe') ? '.exe' : '.zip';
+      const stagedZipPath = path.join(stageDir, `clean-base-${targetAgVer}${pkgExt}`);
       try {
         fs.renameSync(officialSrc.downloadedZipPath, stagedZipPath);
       } catch (err) {
@@ -535,31 +628,34 @@ function createHakimiUpdater(defaultOptions = {}) {
   async function checkAndStageUpgrade(runOptions = {}) {
     if (inFlightCheck) return inFlightCheck;
     const opts = getOpts(runOptions);
+    const plat = opts.platform || process.platform;
 
-    if ((opts.platform || process.platform) !== 'darwin') {
+    if (!isSupportedPlatform(plat)) {
       return buildStatusSnapshot(opts);
     }
 
     const run = (async () => {
-      const paths = builder.getUpdaterPaths(opts);
+      const paths = builder.getUpdaterPaths({ ...opts, platform: plat });
       const targetAppPath = resolveCurrentBundlePath(opts);
       const installed = opts.installedMeta || builder.readInstalledBuildMeta(targetAppPath);
-      const persisted = getPersistedState(opts);
-      const manual = Boolean(opts.manual);
-      const forceMainSync = Boolean(opts.forceMainSync);
+      const ghCfg = resolveGithubTrackingConfig(opts, installed);
+      const effectiveOpts = { ...opts, ...ghCfg, platform: plat };
+      const persisted = getPersistedState(effectiveOpts);
+      const manual = Boolean(effectiveOpts.manual);
+      const forceMainSync = Boolean(effectiveOpts.forceMainSync);
 
       livePhase = 'checking';
       lastRuntimeError = null;
-      notifyStatusChange(opts);
+      notifyStatusChange(effectiveOpts);
 
       const [officialOutcome, hakimiOutcome] = await Promise.allSettled([
         builder.fetchOfficialLatestManifest({
-          ...opts,
+          ...effectiveOpts,
           appBundlePath: targetAppPath,
           currentVersion: installed?.antigravityVersion || undefined,
         }),
         builder.checkHakimiMainUpdate({
-          ...opts,
+          ...effectiveOpts,
           installedCommit: installed?.hakimiCommit || null,
         }),
       ]);
@@ -666,7 +762,7 @@ function createHakimiUpdater(defaultOptions = {}) {
             targetAppPath,
             ephemeralTmpDir,
             cachedPatcherRoot,
-            opts,
+            opts: effectiveOpts,
           });
           cachedPatcherRoot = primaryRes.patcherRoot || cachedPatcherRoot;
 
@@ -676,9 +772,9 @@ function createHakimiUpdater(defaultOptions = {}) {
               staged: primaryRes.stagedEntry,
               incompatible: null,
             };
-            savePersistedState(nextPersisted, opts);
+            savePersistedState(nextPersisted, effectiveOpts);
             livePhase = 'idle';
-            return notifyStatusChange(opts);
+            return notifyStatusChange(effectiveOpts);
           }
 
           // Primary attempt failed (upstream Antigravity breaking change or patch failure):
@@ -694,12 +790,12 @@ function createHakimiUpdater(defaultOptions = {}) {
               testedAt: new Date().toISOString(),
             },
           };
-          savePersistedState(nextPersisted, opts);
+          savePersistedState(nextPersisted, effectiveOpts);
 
           // Fallback: if Hakimi itself also has an update, still allow Hakimi-only update on current AG version!
           if (!hasHakimiUpdate) {
             livePhase = 'idle';
-            return notifyStatusChange(opts);
+            return notifyStatusChange(effectiveOpts);
           }
         }
 
@@ -715,7 +811,7 @@ function createHakimiUpdater(defaultOptions = {}) {
             targetAppPath,
             ephemeralTmpDir,
             cachedPatcherRoot,
-            opts,
+            opts: effectiveOpts,
           });
 
           if (hakimiOnlyRes.ok) {
@@ -752,14 +848,15 @@ function createHakimiUpdater(defaultOptions = {}) {
 
   function installStagedUpgrade(override = {}) {
     const opts = getOpts(override);
-    if ((opts.platform || process.platform) !== 'darwin') {
-      return { ok: false, supported: false, error: '自动更新仅支持 macOS 哈基米.app' };
+    const plat = opts.platform || process.platform;
+    if (!isSupportedPlatform(plat)) {
+      return { ok: false, supported: false, error: '自动更新仅支持 macOS 与 Windows 独立版哈基米' };
     }
     if (coldInstallInFlight) {
       return { ok: false, supported: true, error: '正在执行重启更新，请稍候…' };
     }
 
-    const paths = builder.getUpdaterPaths(opts);
+    const paths = builder.getUpdaterPaths({ ...opts, platform: plat });
     let targetAppPath;
     try {
       targetAppPath = resolveCurrentBundlePath(opts);
@@ -775,7 +872,7 @@ function createHakimiUpdater(defaultOptions = {}) {
     }
 
     try {
-      upgradeHelper.verifyStagedBundleReady(staged.stagedAppPath);
+      upgradeHelper.verifyStagedBundleReady(staged.stagedAppPath, { platform: plat });
     } catch (err) {
       return { ok: false, supported: true, error: err?.message || '更新包校验失败' };
     }
@@ -790,7 +887,7 @@ function createHakimiUpdater(defaultOptions = {}) {
     const homeDir = opts.homeDir ? path.resolve(String(opts.homeDir)) : os.homedir();
     const userDataDir = opts.userDataDir
       ? path.resolve(String(opts.userDataDir))
-      : upgradeHelper.getDefaultUserDataDir(process.platform, process.env, homeDir);
+      : upgradeHelper.getDefaultUserDataDir(plat, process.env, homeDir);
 
     const job = {
       targetAppPath,
@@ -813,7 +910,7 @@ function createHakimiUpdater(defaultOptions = {}) {
       return { ok: false, supported: true, error: writeJob.error || '写入冷更新任务失败' };
     }
 
-    const runtime = resolveWorkerRuntime(opts);
+    const runtime = resolveDetachedSwapRuntime(opts, targetAppPath);
     const spawnImpl = opts.spawnImpl || spawn;
     const logPath = path.join(runtimeDir, upgradeHelper.UPGRADE_LOG_FILE_NAME);
     let logFd = 'ignore';
@@ -826,6 +923,7 @@ function createHakimiUpdater(defaultOptions = {}) {
     try {
       const child = spawnImpl(runtime.bin, [stagedHelperPath, '--job', jobFilePath], {
         detached: true,
+        windowsHide: true,
         stdio: ['ignore', logFd, logFd],
         env: { ...process.env, ...runtime.envExtra },
       });
@@ -1077,8 +1175,11 @@ function getDefaultUpdater() {
 module.exports = {
   UPDATER_CHANGED_CHANNEL,
   MenuUpdateStep,
+  isSupportedPlatform,
   resolveCurrentBundlePath,
   resolveWorkerRuntime,
+  resolveDetachedSwapRuntime,
+  resolveGithubTrackingConfig,
   createHakimiUpdater,
   getDefaultUpdater,
   createNativeUpdaterBridge() {

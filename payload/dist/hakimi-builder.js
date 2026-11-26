@@ -57,6 +57,7 @@ const FALLBACK_LS_ENTITLEMENTS =
   '</dict></plist>\n';
 
 function getUpdaterPaths(options = {}) {
+  const plat = options.platform || process.platform;
   const stateDir = options.stateDir ? path.resolve(String(options.stateDir)) : asarEngine.getStateDir();
   const homeDir = options.homeDir ? path.resolve(String(options.homeDir)) : os.homedir();
   const updaterDir = path.join(stateDir, 'updater');
@@ -64,9 +65,16 @@ function getUpdaterPaths(options = {}) {
   const stagingDir = path.join(updaterDir, 'staging');
   const tmpDir = path.join(updaterDir, 'tmp');
   const statePath = path.join(updaterDir, UPDATER_STATE_FILENAME);
+  const localAppDataForCache = options.homeDir
+    ? path.join(homeDir, 'AppData', 'Local')
+    : process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+  const defaultNativeCache =
+    plat === 'win32'
+      ? path.join(localAppDataForCache, 'antigravity-updater')
+      : path.join(homeDir, 'Library', 'Caches', 'com.google.antigravity');
   const nativeCacheDir = options.nativeCacheDir
     ? path.resolve(String(options.nativeCacheDir))
-    : path.join(homeDir, 'Library', 'Caches', 'com.google.antigravity');
+    : defaultNativeCache;
   return {
     stateDir,
     homeDir,
@@ -165,12 +173,18 @@ function parseAppUpdateYml(ymlText) {
 function resolveOfficialFeedUrl(appBundlePath) {
   const candidates = [];
   if (appBundlePath) {
-    candidates.push(path.join(path.resolve(String(appBundlePath)), 'Contents', 'Resources', 'app-update.yml'));
+    const resolved = path.resolve(String(appBundlePath));
+    candidates.push(path.join(asarEngine.getResourcesDir(resolved), 'app-update.yml'));
+    candidates.push(path.join(resolved, 'Contents', 'Resources', 'app-update.yml'));
+    candidates.push(path.join(resolved, 'resources', 'app-update.yml'));
   }
   if (process.resourcesPath) {
     candidates.push(path.join(process.resourcesPath, 'app-update.yml'));
   }
-  candidates.push(path.join(asarEngine.getHakimiAppPath(), 'Contents', 'Resources', 'app-update.yml'));
+  const hakimiApp = asarEngine.getHakimiAppPath();
+  candidates.push(path.join(asarEngine.getResourcesDir(hakimiApp), 'app-update.yml'));
+  const officialApp = asarEngine.getDefaultOfficialAppPath();
+  candidates.push(path.join(asarEngine.getResourcesDir(officialApp), 'app-update.yml'));
   candidates.push('/Applications/Antigravity.app/Contents/Resources/app-update.yml');
 
   for (const ymlPath of candidates) {
@@ -262,6 +276,49 @@ function manifestHasZipEntry(manifest) {
     return true;
   }
   return Boolean(manifest?.path && /\.zip(?:$|\?)/i.test(manifest.path));
+}
+
+function manifestHasWinExeEntry(manifest) {
+  const files = Array.isArray(manifest?.files) ? manifest.files : [];
+  if (files.some((f) => f && typeof f.url === 'string' && /\.exe(?:$|\?)/i.test(f.url))) {
+    return true;
+  }
+  return Boolean(manifest?.path && /\.exe(?:$|\?)/i.test(manifest.path));
+}
+
+function selectWinInstallerFromManifest(manifest, feedUrl, arch = process.arch || 'x64') {
+  const files = Array.isArray(manifest?.files) ? manifest.files : [];
+  const exeCandidates = files.filter((f) => f && typeof f.url === 'string' && /\.exe(?:$|\?)/i.test(f.url));
+  let chosen = null;
+  if (exeCandidates.length > 0) {
+    if (arch === 'arm64') {
+      chosen = exeCandidates.find((f) => /arm64|windows-arm/i.test(f.url)) || exeCandidates[0];
+    } else {
+      chosen = exeCandidates.find((f) => /x64|windows-x64/i.test(f.url)) || exeCandidates[0];
+    }
+  } else if (manifest?.path && /\.exe(?:$|\?)/i.test(manifest.path)) {
+    chosen = { url: manifest.path, sha512: manifest.sha512 || '', size: 0 };
+  }
+  if (!chosen || !chosen.url) {
+    throw new Error('官方更新清单中未找到 Windows EXE 安装包');
+  }
+  const downloadUrl = resolveFileDownloadUrl(chosen.url, feedUrl);
+  if (!isAllowedOfficialUrl(downloadUrl, feedUrl)) {
+    throw new Error(`拦截非官方白名单下载地址: ${downloadUrl}`);
+  }
+  const sha512 = String(chosen.sha512 || manifest?.sha512 || '').trim();
+  if (!sha512) {
+    throw new Error('官方更新清单缺少 SHA-512 校验摘要');
+  }
+  return {
+    version: String(manifest.version || '').trim(),
+    url: downloadUrl,
+    sha512,
+    size: Number.isFinite(chosen.size) ? chosen.size : 0,
+    releaseDate: manifest.releaseDate || '',
+    platform: 'win32',
+    ext: '.exe',
+  };
 }
 
 function selectMacZipFromManifest(manifest, feedUrl, arch = process.arch) {
@@ -457,8 +514,11 @@ function computeFileSha512Base64(filePath) {
 
 async function fetchOfficialLatestManifest(options = {}) {
   const feedUrl = options.feedUrl || resolveOfficialFeedUrl(options.appBundlePath);
-  const arch = options.arch || process.arch || 'arm64';
-  const manifestUrl = new URL(`latest-${arch}-mac.yml`, feedUrl.endsWith('/') ? feedUrl : `${feedUrl}/`).toString();
+  const plat = options.platform || process.platform;
+  const isWin = plat === 'win32';
+  const arch = options.arch || process.arch || (isWin ? 'x64' : 'arm64');
+  const manifestName = isWin ? `latest-${arch}-win.yml` : `latest-${arch}-mac.yml`;
+  const manifestUrl = new URL(manifestName, feedUrl.endsWith('/') ? feedUrl : `${feedUrl}/`).toString();
   const httpImpl = options.httpRequest || defaultHttpRequest;
   const currentVersion = options.currentVersion ? String(options.currentVersion).trim() : '';
   const requireDownload = options.requireDownload === true;
@@ -485,8 +545,9 @@ async function fetchOfficialLatestManifest(options = {}) {
 
   const sentCurrentVersion = Boolean(currentVersion && !requireDownload);
   let parsed = await requestManifest(sentCurrentVersion);
+  const hasEntry = isWin ? manifestHasWinExeEntry(parsed) : manifestHasZipEntry(parsed);
 
-  if (!manifestHasZipEntry(parsed)) {
+  if (!hasEntry) {
     // Official manifest server omits `files:`/`path:` (returning only `version: X.Y.Z`) when
     // `x-app-version` matches or exceeds the latest release. Treat as cleanly up-to-date.
     if (sentCurrentVersion && compareSemver(parsed.version, currentVersion) <= 0) {
@@ -507,7 +568,9 @@ async function fetchOfficialLatestManifest(options = {}) {
     }
   }
 
-  const selected = selectMacZipFromManifest(parsed, feedUrl, arch);
+  const selected = isWin
+    ? selectWinInstallerFromManifest(parsed, feedUrl, arch)
+    : selectMacZipFromManifest(parsed, feedUrl, arch);
   return {
     ...selected,
     upToDate: Boolean(currentVersion && compareSemver(selected.version, currentVersion) <= 0),
@@ -532,16 +595,23 @@ function readCleanBaseMeta(cleanBaseDir) {
 function enforceSingleSlotCleanBase({ cleanBaseDir, keepVersion = '', keepFileName = '' }) {
   const removed = [];
   if (!cleanBaseDir || !fs.existsSync(cleanBaseDir)) return { removed };
-  const targetKeep = keepFileName || (keepVersion ? `Antigravity-${keepVersion}.zip` : '');
+  const keepSet = new Set();
+  if (keepFileName) {
+    keepSet.add(keepFileName);
+  } else if (keepVersion) {
+    keepSet.add(`Antigravity-${keepVersion}.zip`);
+    keepSet.add(`Antigravity-${keepVersion}.exe`);
+  }
   try {
     for (const name of fs.readdirSync(cleanBaseDir)) {
-      if (name.endsWith('.zip') && name !== targetKeep) {
+      if ((name.endsWith('.zip') || name.endsWith('.exe')) && !keepSet.has(name)) {
         if (upgradeHelper.unlinkIfExists(path.join(cleanBaseDir, name))) {
           removed.push(name);
         }
       }
     }
-    if (!targetKeep || !fs.existsSync(path.join(cleanBaseDir, targetKeep))) {
+    const anyKeptExists = [...keepSet].some((k) => fs.existsSync(path.join(cleanBaseDir, k)));
+    if (!anyKeptExists) {
       upgradeHelper.unlinkIfExists(path.join(cleanBaseDir, CLEAN_BASE_META_FILENAME));
     }
   } catch {}
@@ -549,11 +619,14 @@ function enforceSingleSlotCleanBase({ cleanBaseDir, keepVersion = '', keepFileNa
 }
 
 /**
- * Acquire verified official zip into `destZipPath` (preferring existing verified single-slot
- * clean-base or native pending cache before downloading over HTTPS).
+ * Acquire verified official package (macOS .zip or Windows NSIS .exe) into `destZipPath`
+ * (preferring existing verified single-slot clean-base or native pending cache before downloading over HTTPS).
  */
 async function acquireOfficialVerifiedZip(manifest, destZipPath, options = {}) {
-  const paths = getUpdaterPaths(options);
+  const plat = options.platform || process.platform;
+  const isWin = plat === 'win32' || String(manifest?.url || '').toLowerCase().endsWith('.exe');
+  const arch = options.arch || process.arch || (isWin ? 'x64' : 'arm64');
+  const paths = getUpdaterPaths({ ...options, platform: plat });
   const httpImpl = options.httpRequest || defaultHttpRequest;
   const expectedSha = String(manifest?.sha512 || '').trim();
   if (!manifest?.url || !expectedSha) {
@@ -571,11 +644,20 @@ async function acquireOfficialVerifiedZip(manifest, destZipPath, options = {}) {
     }
   }
 
-  // 2. Check existing native Electron updater pending cache (avoids duplicate 216MB download!)
-  const nativeCandidates = [
-    path.join(paths.nativeCacheDir, 'pending', 'Antigravity.zip'),
-    path.join(paths.nativeCacheDir, 'update.zip'),
-  ];
+  // 2. Check existing native Electron updater pending cache (avoids duplicate ~170-216MB download!)
+  const nativeCandidates = isWin
+    ? [
+        path.join(paths.nativeCacheDir, 'pending', `Antigravity-${arch}.exe`),
+        path.join(paths.nativeCacheDir, 'pending', 'Antigravity-x64.exe'),
+        path.join(paths.nativeCacheDir, 'installer.exe'),
+      ]
+    : [
+        path.join(paths.nativeCacheDir, 'pending', 'Antigravity.zip'),
+        path.join(paths.nativeCacheDir, 'update.zip'),
+      ];
+  const officialRootForCheck = isWin
+    ? asarEngine.getDefaultOfficialAppPath('win32')
+    : '/Applications/Antigravity.app';
   for (const cand of nativeCandidates) {
     if (!fs.existsSync(cand)) continue;
     try {
@@ -584,7 +666,7 @@ async function acquireOfficialVerifiedZip(manifest, destZipPath, options = {}) {
         const officialRunning =
           options.skipOfficialRunningCheck === true
             ? false
-            : upgradeHelper.findRunningTargetPids('/Applications/Antigravity.app', 'all', options).length > 0;
+            : upgradeHelper.findRunningTargetPids(officialRootForCheck, 'all', { ...options, platform: plat }).length > 0;
         if (!officialRunning && options.consumeNativePending !== false) {
           try {
             fs.renameSync(cand, destZipPath);
@@ -668,7 +750,200 @@ function verifyOfficialGoogleBundleSignature(appPath, options = {}) {
   return { ok: true, teamId: GOOGLE_TEAM_ID, bundleId: GOOGLE_BUNDLE_ID };
 }
 
+const SEVEN_ZIP_MAGIC = Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+const ELECTRON_FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'utf8');
+
+function verifyOfficialWindowsInstallerSignature(exePath, options = {}) {
+  const execImpl = options.execFileSync || execFileSync;
+  if (!exePath || !fs.existsSync(exePath)) {
+    throw new Error(`官方 Windows 安装包不存在: ${exePath}`);
+  }
+  const escaped = path.resolve(String(exePath)).replace(/'/g, "''");
+  const psScript = [
+    `$sig = Get-AuthenticodeSignature -LiteralPath '${escaped}';`,
+    '@{ Status = [string]$sig.Status; Subject = if ($sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { "" } } | ConvertTo-Json -Compress',
+  ].join(' ');
+  let out = '';
+  try {
+    out = execImpl(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000, windowsHide: true }
+    );
+  } catch (err) {
+    throw new Error(`校验官方 Windows Authenticode 签名失败: ${err?.message || String(err)}`);
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(out || '').trim());
+  } catch {
+    throw new Error('无法解析 Windows Authenticode 签名校验结果');
+  }
+  if (!parsed || parsed.Status !== 'Valid') {
+    throw new Error(`官方 Windows 安装包签名状态无效: ${parsed?.Status || 'unknown'}`);
+  }
+  const subject = String(parsed.Subject || '');
+  if (!/CN\s*=\s*Google LLC/i.test(subject) || !/O\s*=\s*Google LLC/i.test(subject)) {
+    throw new Error(`官方 Windows 安装包签发主体不是 Google LLC: ${subject || '(空)'}`);
+  }
+  return { ok: true, status: parsed.Status, subject };
+}
+
+function find7zBinary(options = {}) {
+  if (options.sevenZipBin && fs.existsSync(options.sevenZipBin)) {
+    return options.sevenZipBin;
+  }
+  const candidates = [
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, '7-Zip', '7z.exe') : null,
+    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], '7-Zip', '7z.exe') : null,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', '7-Zip', '7z.exe') : null,
+  ].filter(Boolean);
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (dir) candidates.push(path.join(dir, '7z.exe'));
+  }
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand) && fs.statSync(cand).isFile()) return cand;
+    } catch {}
+  }
+  return null;
+}
+
+function findWindowsTarBinary(options = {}) {
+  if (options.tarBin) return options.tarBin;
+  if (process.platform === 'win32') {
+    const sysTar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+    if (fs.existsSync(sysTar)) return sysTar;
+    return 'tar.exe';
+  }
+  return '/usr/bin/tar';
+}
+
+/**
+ * Locate embedded `.7z` payload inside a Windows NSIS / 7z SFX installer by scanning
+ * for the 6-byte 7z signature header (`37 7A BC AF 27 1C`) and reading exact archive length.
+ */
+function locateEmbedded7zSlice(exePath) {
+  const fd = fs.openSync(exePath, 'r');
+  try {
+    const stat = fs.fstatSync(fd);
+    const scanSize = Math.min(stat.size, 8 * 1024 * 1024);
+    const head = Buffer.alloc(scanSize);
+    fs.readSync(fd, head, 0, scanSize, 0);
+
+    let pos = 0;
+    while ((pos = head.indexOf(SEVEN_ZIP_MAGIC, pos)) !== -1) {
+      if (pos + 32 <= head.length) {
+        const majorVer = head[pos + 6];
+        const nextHdrOff = Number(head.readBigUInt64LE(pos + 12));
+        const nextHdrSize = Number(head.readBigUInt64LE(pos + 20));
+        const archiveLen = 32 + nextHdrOff + nextHdrSize;
+        if (majorVer === 0 && archiveLen > 32 && pos + archiveLen <= stat.size) {
+          return { offset: pos, length: archiveLen, fileSize: stat.size };
+        }
+      }
+      pos += 6;
+    }
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function extractEmbedded7zWithBsdtar(exePath, extractDir, options = {}) {
+  const execImpl = options.execFileSync || execFileSync;
+  const slice = locateEmbedded7zSlice(exePath);
+  if (!slice) {
+    throw new Error('未在官方 Windows 安装包中找到内嵌 7z 载荷');
+  }
+  const tmp7z = path.join(path.dirname(extractDir), `.hakimi-embedded-${process.pid}-${Date.now()}.7z`);
+  const inFd = fs.openSync(exePath, 'r');
+  let outFd = null;
+  try {
+    outFd = fs.openSync(tmp7z, 'w');
+    const buf = Buffer.alloc(4 * 1024 * 1024);
+    let pos = slice.offset;
+    let remaining = slice.length;
+    while (remaining > 0) {
+      const toRead = Math.min(buf.length, remaining);
+      const n = fs.readSync(inFd, buf, 0, toRead, pos);
+      if (n <= 0) break;
+      fs.writeSync(outFd, buf, 0, n);
+      pos += n;
+      remaining -= n;
+    }
+    fs.closeSync(outFd);
+    outFd = null;
+
+    const tarBin = findWindowsTarBinary(options);
+    execImpl(tarBin, ['-xf', tmp7z, '-C', extractDir], {
+      stdio: 'pipe',
+      timeout: 180000,
+      windowsHide: true,
+    });
+  } finally {
+    try { fs.closeSync(inFd); } catch {}
+    if (outFd !== null) {
+      try { fs.closeSync(outFd); } catch {}
+    }
+    upgradeHelper.unlinkIfExists(tmp7z);
+  }
+}
+
+function checkWinExeAsarIntegrityFuse(exePath) {
+  if (!exePath || !fs.existsSync(exePath)) return { found: false, integrityEnabled: false };
+  const buf = fs.readFileSync(exePath);
+  const idx = buf.indexOf(ELECTRON_FUSE_SENTINEL);
+  if (idx < 0) return { found: false, integrityEnabled: false };
+  const count = buf[idx + ELECTRON_FUSE_SENTINEL.length + 1];
+  const integrityByte = count > 4 ? buf[idx + ELECTRON_FUSE_SENTINEL.length + 2 + 4] : 0x30;
+  return { found: true, integrityEnabled: integrityByte === 0x31 };
+}
+
+function extractOfficialWinInstallerAndVerify(exePath, extractDir, options = {}) {
+  const execImpl = options.execFileSync || execFileSync;
+  if (options.skipGoogleSignatureCheck !== true && (options.platform || process.platform) === 'win32') {
+    verifyOfficialWindowsInstallerSignature(exePath, options);
+  }
+
+  fs.mkdirSync(extractDir, { recursive: true });
+  const sevenZip = options.forceBsdtar ? null : find7zBinary(options);
+  let extractedBy7z = false;
+  if (sevenZip) {
+    try {
+      execImpl(sevenZip, ['x', '-t7z', '-y', `-o${extractDir}`, exePath], {
+        stdio: 'pipe',
+        timeout: 180000,
+        windowsHide: true,
+      });
+      extractedBy7z = true;
+    } catch {
+      extractedBy7z = false;
+    }
+  }
+  if (!extractedBy7z) {
+    extractEmbedded7zWithBsdtar(exePath, extractDir, options);
+  }
+
+  const exeInside = path.join(extractDir, 'Antigravity.exe');
+  const asarInside = path.join(extractDir, 'resources', 'app.asar');
+  if (!fs.existsSync(exeInside) || !fs.existsSync(asarInside)) {
+    throw new Error('解压后的官方 Windows 安装包缺少 Antigravity.exe 或 resources\\app.asar');
+  }
+
+  const fuseCheck = checkWinExeAsarIntegrityFuse(exeInside);
+  if (fuseCheck.found && fuseCheck.integrityEnabled) {
+    throw new Error('新版官方 Antigravity.exe 开启了 EnableEmbeddedAsarIntegrityValidation=1，暂不兼容自动更新');
+  }
+
+  return extractDir;
+}
+
 function extractOfficialZipAndVerify(zipPath, extractDir, options = {}) {
+  const plat = options.platform || process.platform;
+  if (plat === 'win32' || String(zipPath || '').toLowerCase().endsWith('.exe')) {
+    return extractOfficialWinInstallerAndVerify(zipPath, extractDir, options);
+  }
   const execImpl = options.execFileSync || execFileSync;
   fs.mkdirSync(extractDir, { recursive: true });
   execImpl('/usr/bin/ditto', ['-xk', zipPath, extractDir], { stdio: 'pipe' });
@@ -988,7 +1263,11 @@ async function downloadAndExtractHakimiTarball({ sha, destTmpDir }, options = {}
   }
 
   try {
-    execImpl('/usr/bin/tar', ['-xzf', tarPath, '-C', extractDir], { stdio: 'pipe' });
+    const tarBin = findWindowsTarBinary(options);
+    execImpl(tarBin, ['-xzf', tarPath, '-C', extractDir], {
+      stdio: 'pipe',
+      windowsHide: true,
+    });
   } finally {
     upgradeHelper.unlinkIfExists(tarPath);
   }
@@ -1000,7 +1279,8 @@ async function downloadAndExtractHakimiTarball({ sha, destTmpDir }, options = {}
   const repoRoot = dirs.find(
     (d) =>
       fs.existsSync(path.join(d, 'scripts', 'pack-hakimi-asar.js')) &&
-      fs.existsSync(path.join(d, 'payload', 'dist', 'meter-region-unlock.js'))
+      (fs.existsSync(path.join(d, 'payload', 'dist', 'hakimi-asar-packer.js')) ||
+        fs.existsSync(path.join(d, 'payload', 'dist', 'meter-region-unlock.js')))
   );
   if (!repoRoot) {
     throw new Error('解压后的哈基米源码包缺少必要的 scripts/ 或 payload/dist/ 文件');
@@ -1024,7 +1304,13 @@ function readInstalledBuildMeta(appBundlePath) {
   const plistPath = path.join(bundle, 'Contents', 'Info.plist');
   const resDir = asarEngine.getResourcesDir(bundle);
   const metaPath = path.join(resDir, BUILD_META_FILENAME);
-  const plistVersion = readBundleShortVersion(plistPath);
+  let detectedVersion = readBundleShortVersion(plistPath);
+  if (!detectedVersion) {
+    try {
+      const modulesConfig = require('./modules-config');
+      detectedVersion = modulesConfig.readAppVersion(bundle);
+    } catch {}
+  }
   const res = upgradeHelper.readJsonFileSafe(metaPath, null);
   const parsed = res.ok && res.data && typeof res.data === 'object' ? res.data : {};
   const hakimiCommit = typeof parsed.hakimiCommit === 'string' && SHA40_RE.test(parsed.hakimiCommit.trim())
@@ -1032,7 +1318,7 @@ function readInstalledBuildMeta(appBundlePath) {
     : null;
   return {
     schemaVersion: 1,
-    antigravityVersion: plistVersion || parsed.antigravityVersion || null,
+    antigravityVersion: detectedVersion || parsed.antigravityVersion || null,
     hakimiVersion: parsed.hakimiVersion || null,
     hakimiCommit,
     hakimiCommitShort: hakimiCommit ? hakimiCommit.slice(0, 7) : (parsed.hakimiCommitShort || null),
@@ -1040,6 +1326,9 @@ function readInstalledBuildMeta(appBundlePath) {
     gitDirty: Boolean(parsed.gitDirty),
     sourceKind: parsed.sourceKind || 'unknown',
     builtAt: parsed.builtAt || null,
+    ...(parsed.githubOwner ? { githubOwner: String(parsed.githubOwner) } : {}),
+    ...(parsed.githubRepo ? { githubRepo: String(parsed.githubRepo) } : {}),
+    ...(parsed.githubBranch ? { githubBranch: String(parsed.githubBranch) } : {}),
   };
 }
 
@@ -1051,9 +1340,15 @@ function writeBuildMeta(appBundlePath, meta = {}) {
   const commit = typeof meta.hakimiCommit === 'string' && SHA40_RE.test(meta.hakimiCommit.trim())
     ? meta.hakimiCommit.trim()
     : null;
+  let fallbackVersion = readBundleShortVersion(path.join(bundle, 'Contents', 'Info.plist'));
+  if (!fallbackVersion) {
+    try {
+      fallbackVersion = require('./modules-config').readAppVersion(bundle);
+    } catch {}
+  }
   const payload = {
     schemaVersion: 1,
-    antigravityVersion: meta.antigravityVersion || readBundleShortVersion(path.join(bundle, 'Contents', 'Info.plist')) || null,
+    antigravityVersion: meta.antigravityVersion || fallbackVersion || null,
     hakimiVersion: meta.hakimiVersion || null,
     hakimiCommit: commit,
     hakimiCommitShort: commit ? commit.slice(0, 7) : null,
@@ -1061,6 +1356,9 @@ function writeBuildMeta(appBundlePath, meta = {}) {
     gitDirty: Boolean(meta.gitDirty),
     sourceKind: meta.sourceKind || 'official-local',
     builtAt: meta.builtAt || new Date().toISOString(),
+    ...(meta.githubOwner ? { githubOwner: String(meta.githubOwner) } : {}),
+    ...(meta.githubRepo ? { githubRepo: String(meta.githubRepo) } : {}),
+    ...(meta.githubBranch ? { githubBranch: String(meta.githubBranch) } : {}),
   };
   fs.mkdirSync(path.dirname(metaPath), { recursive: true });
   fs.writeFileSync(metaPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
@@ -1145,11 +1443,182 @@ function cloneAppBundle(srcAppPath, destAppPath, execImpl = execFileSync) {
   execImpl('/bin/cp', ['-R', '-p', srcAppPath, destAppPath], { stdio: 'pipe' });
 }
 
+function copyWinDirFiltered(srcDir, destDir, isRoot = true) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    if (isRoot && entry.name.toLowerCase() === 'uninstall antigravity.exe') continue;
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyWinDirFiltered(srcPath, destPath, false);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(srcPath, destPath);
+    } else if (entry.isSymbolicLink()) {
+      try {
+        fs.symlinkSync(fs.readlinkSync(srcPath), destPath);
+      } catch {
+        const st = fs.statSync(srcPath);
+        if (st.isDirectory()) copyWinDirFiltered(srcPath, destPath, false);
+        else if (st.isFile()) fs.copyFileSync(srcPath, destPath);
+      }
+    }
+  }
+}
+
+function stageBuildHakimiWinApp(spec = {}, options = {}) {
+  const sourceAppPath = path.resolve(String(spec.sourceAppPath || ''));
+  const stageDir = path.resolve(String(spec.stageDir || ''));
+  const patcherRoot = spec.patcherRoot ? path.resolve(String(spec.patcherRoot)) : null;
+
+  asarEngine.assertNotOfficialAntigravityApp(stageDir, '创建沙盒目录');
+  const stageAppPath = path.join(stageDir, 'Hakimi');
+  asarEngine.assertNotOfficialAntigravityApp(stageAppPath, '构建沙盒应用');
+
+  let currentStage = 'preflight';
+  try {
+    if (!fs.existsSync(sourceAppPath)) {
+      throw new Error(`找不到源应用目录: ${sourceAppPath}`);
+    }
+    const srcExe = path.join(sourceAppPath, 'Antigravity.exe');
+    const srcAsar = path.join(sourceAppPath, 'resources', 'app.asar');
+    if (!fs.existsSync(srcExe)) throw new Error(`源目录缺少 Antigravity.exe: ${srcExe}`);
+    if (!fs.existsSync(srcAsar)) throw new Error(`源目录缺少 resources\\app.asar: ${srcAsar}`);
+
+    const fuseCheck = checkWinExeAsarIntegrityFuse(srcExe);
+    if (fuseCheck.found && fuseCheck.integrityEnabled) {
+      throw new Error('新版官方 Antigravity.exe 开启了 EnableEmbeddedAsarIntegrityValidation=1，暂不兼容自动更新');
+    }
+
+    const modulesConfig = require('./modules-config');
+    const sourceVersion = spec.antigravityVersion || modulesConfig.readAppVersion(sourceAppPath) || 'unknown';
+
+    // Stage 1: Copy clean source directory into staging directory
+    currentStage = 'copy-source';
+    if (fs.existsSync(stageDir)) {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(stageDir, { recursive: true });
+    copyWinDirFiltered(sourceAppPath, stageAppPath, true);
+
+    const stageAsar = path.join(stageAppPath, 'resources', 'app.asar');
+    const targetInstalledAppPath = spec.targetInstalledAppPath
+      ? path.resolve(String(spec.targetInstalledAppPath))
+      : asarEngine.getHakimiAppPath();
+
+    // Preserve custom Windows shortcut/window icon across auto-upgrades when present
+    let usingCustomIcon = false;
+    let customIconPngPath = null;
+    if (spec.preserveCustomIcon !== false && targetInstalledAppPath && fs.existsSync(targetInstalledAppPath)) {
+      const curIco = path.join(targetInstalledAppPath, 'resources', 'hakimi.ico');
+      const curAsar = path.join(targetInstalledAppPath, 'resources', 'app.asar');
+      if (fs.existsSync(curIco)) {
+        usingCustomIcon = true;
+        fs.copyFileSync(curIco, path.join(stageAppPath, 'resources', 'hakimi.ico'));
+        if (fs.existsSync(curAsar)) {
+          try {
+            customIconPngPath = path.join(stageDir, 'carryover-win-icon.png');
+            fs.writeFileSync(customIconPngPath, asarEngine.builtinAsar.extractFile(curAsar, 'icon.png'));
+          } catch {
+            customIconPngPath = null;
+          }
+        }
+      }
+    }
+
+    // Stage 2: Repack app.asar (utils + preload + SSH + updater wrapper + payload)
+    currentStage = 'pack-asar';
+    const packerMod = patcherRoot
+      ? require(path.join(patcherRoot, 'scripts', 'pack-hakimi-asar.js'))
+      : require('./hakimi-asar-packer');
+    const payloadDistDir = patcherRoot ? path.join(patcherRoot, 'payload', 'dist') : __dirname;
+    const packRes = packerMod.packHakimiAsar({
+      srcAsar,
+      destAsar: stageAsar,
+      payloadDistDir,
+      iconPng: customIconPngPath,
+      skipConfig: true,
+    });
+    if (customIconPngPath) upgradeHelper.unlinkIfExists(customIconPngPath);
+    if (!packRes || !packRes.ok || !packRes.sha256) {
+      throw new Error('app.asar 重打包失败');
+    }
+
+    // Stage 3: Verify packed modules inside staging directory
+    currentStage = 'verify';
+    const inspect = modulesConfig.inspectDiskModules(stageAsar);
+    if (
+      !inspect.found ||
+      !inspect.meterReady ||
+      !inspect.chineseReady ||
+      !inspect.markdownFixReady ||
+      (inspect.updaterSupported && !inspect.updaterReady)
+    ) {
+      throw new Error(`Windows 沙盒产物模块校验失败: ${JSON.stringify(inspect)}`);
+    }
+
+    // Stage 4: Write build metadata receipt
+    currentStage = 'build-meta';
+    let hakimiVersion = spec.hakimiVersion || null;
+    if (!hakimiVersion && patcherRoot && fs.existsSync(path.join(patcherRoot, 'package.json'))) {
+      try {
+        hakimiVersion = JSON.parse(fs.readFileSync(path.join(patcherRoot, 'package.json'), 'utf8')).version || null;
+      } catch {}
+    }
+    if (!hakimiVersion) {
+      hakimiVersion = modulesConfig.PROJECT_VERSION || null;
+    }
+    const buildMeta = writeBuildMeta(stageAppPath, {
+      antigravityVersion: sourceVersion,
+      hakimiVersion,
+      hakimiCommit: spec.hakimiCommit || null,
+      hakimiCommitDate: spec.hakimiCommitDate || null,
+      gitDirty: Boolean(spec.gitDirty),
+      sourceKind: spec.sourceKind || 'official-feed',
+      githubOwner: spec.githubOwner || undefined,
+      githubRepo: spec.githubRepo || undefined,
+      githubBranch: spec.githubBranch || undefined,
+    });
+
+    return {
+      ok: true,
+      stageDir,
+      stagedAppPath: stageAppPath,
+      antigravityVersion: sourceVersion,
+      hakimiVersion: buildMeta.hakimiVersion,
+      hakimiCommit: buildMeta.hakimiCommit,
+      asarSha256: packRes.sha256,
+      usingCustomIcon,
+      inspect,
+      buildMeta,
+    };
+  } catch (err) {
+    try {
+      if (fs.existsSync(stageDir)) {
+        asarEngine.assertNotOfficialAntigravityApp(stageDir, '清理失败沙盒');
+        fs.rmSync(stageDir, { recursive: true, force: true });
+      }
+    } catch {}
+    return {
+      ok: false,
+      failedStage: currentStage,
+      error: err?.message || String(err),
+    };
+  }
+}
+
 /**
  * Full sandbox stage-build with structured per-stage failure reporting.
  * Always deletes `stageDir` immediately if any stage fails.
  */
 function stageBuildHakimiApp(spec = {}, options = {}) {
+  const sourcePathStr = String(spec.sourceAppPath || '');
+  const isWinBuild =
+    !sourcePathStr.toLowerCase().endsWith('.app') &&
+    ((options.platform || process.platform) === 'win32' ||
+      fs.existsSync(path.join(path.resolve(sourcePathStr), 'Antigravity.exe')));
+  if (isWinBuild) {
+    return stageBuildHakimiWinApp(spec, options);
+  }
   const execImpl = options.execFileSync || execFileSync;
   const sourceAppPath = path.resolve(String(spec.sourceAppPath || ''));
   const stageDir = path.resolve(String(spec.stageDir || ''));
@@ -1445,29 +1914,47 @@ function cleanupOrphanUpdaterArtifacts(options = {}) {
     report.cleanedCleanBase.push(...cbRes.removed);
   }
 
-  // 5. Avoid duplicating 216MB zip in ~/Library/Caches/com.google.antigravity/ when safe
+  // 5. Avoid duplicating official installer/zip in native Electron updater cache when safe
   if (fs.existsSync(paths.nativeCacheDir)) {
+    const isWin =
+      (options.platform || process.platform) === 'win32' &&
+      !String(targetAppPath || '').toLowerCase().endsWith('.app');
+    const officialRootForCheck = isWin
+      ? asarEngine.getDefaultOfficialAppPath('win32')
+      : '/Applications/Antigravity.app';
     const officialRunning =
       options.skipOfficialRunningCheck === true
         ? false
-        : upgradeHelper.findRunningTargetPids('/Applications/Antigravity.app', 'all', options).length > 0;
+        : upgradeHelper.findRunningTargetPids(officialRootForCheck, 'all', options).length > 0;
     if (!officialRunning) {
       const hasCleanSlot = Boolean(readCleanBaseMeta(paths.cleanBaseDir));
-      const updateZip = path.join(paths.nativeCacheDir, 'update.zip');
-      if (hasCleanSlot && fs.existsSync(updateZip)) {
-        if (upgradeHelper.unlinkIfExists(updateZip)) report.cleanedNativeCache.push('update.zip');
-      }
-      // If pending/Antigravity.zip matches a version already staged or already installed, remove duplicate
-      const pendingZip = path.join(paths.nativeCacheDir, 'pending', 'Antigravity.zip');
-      if (hasCleanSlot && fs.existsSync(pendingZip)) {
-        const cleanMeta = readCleanBaseMeta(paths.cleanBaseDir);
+      const cleanMeta = hasCleanSlot ? readCleanBaseMeta(paths.cleanBaseDir) : null;
+      if (isWin) {
         const pendingInfo = upgradeHelper.readJsonFileSafe(
           path.join(paths.nativeCacheDir, 'pending', 'update-info.json'),
           null
         );
+        const pendingFileName = pendingInfo?.data?.fileName || 'Antigravity-x64.exe';
+        const pendingExe = path.join(paths.nativeCacheDir, 'pending', pendingFileName);
         if (cleanMeta?.sha512 && pendingInfo?.data?.sha512 && cleanMeta.sha512 === pendingInfo.data.sha512) {
-          if (upgradeHelper.unlinkIfExists(pendingZip)) report.cleanedNativeCache.push('pending/Antigravity.zip');
+          if (upgradeHelper.unlinkIfExists(pendingExe)) report.cleanedNativeCache.push(`pending/${pendingFileName}`);
           upgradeHelper.unlinkIfExists(path.join(paths.nativeCacheDir, 'pending', 'update-info.json'));
+        }
+      } else {
+        const updateZip = path.join(paths.nativeCacheDir, 'update.zip');
+        if (hasCleanSlot && fs.existsSync(updateZip)) {
+          if (upgradeHelper.unlinkIfExists(updateZip)) report.cleanedNativeCache.push('update.zip');
+        }
+        const pendingZip = path.join(paths.nativeCacheDir, 'pending', 'Antigravity.zip');
+        if (hasCleanSlot && fs.existsSync(pendingZip)) {
+          const pendingInfo = upgradeHelper.readJsonFileSafe(
+            path.join(paths.nativeCacheDir, 'pending', 'update-info.json'),
+            null
+          );
+          if (cleanMeta?.sha512 && pendingInfo?.data?.sha512 && cleanMeta.sha512 === pendingInfo.data.sha512) {
+            if (upgradeHelper.unlinkIfExists(pendingZip)) report.cleanedNativeCache.push('pending/Antigravity.zip');
+            upgradeHelper.unlinkIfExists(path.join(paths.nativeCacheDir, 'pending', 'update-info.json'));
+          }
         }
       }
     }
@@ -1600,7 +2087,9 @@ module.exports = {
   resolveOfficialFeedUrl,
   parseLatestMacYml,
   manifestHasZipEntry,
+  manifestHasWinExeEntry,
   selectMacZipFromManifest,
+  selectWinInstallerFromManifest,
   decodeXmlEntities,
   parseGithubCommitsAtom,
   parseGitUploadPackBranchSha,
@@ -1611,6 +2100,13 @@ module.exports = {
   enforceSingleSlotCleanBase,
   acquireOfficialVerifiedZip,
   verifyOfficialGoogleBundleSignature,
+  verifyOfficialWindowsInstallerSignature,
+  find7zBinary,
+  findWindowsTarBinary,
+  locateEmbedded7zSlice,
+  extractEmbedded7zWithBsdtar,
+  checkWinExeAsarIntegrityFuse,
+  extractOfficialWinInstallerAndVerify,
   extractOfficialZipAndVerify,
   checkHakimiMainUpdate,
   downloadAndExtractHakimiTarball,
@@ -1620,6 +2116,7 @@ module.exports = {
   updateInfoPlistIntegrity,
   extractEntitlements,
   cloneAppBundle,
+  stageBuildHakimiWinApp,
   stageBuildHakimiApp,
   cleanupOrphanUpdaterArtifacts,
 };
