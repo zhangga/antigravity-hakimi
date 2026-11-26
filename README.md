@@ -75,6 +75,8 @@ npm run doctor
 
 ### 2. Windows 10 / 11 独立版构建、多账号冷切与自动更新
 
+> 完整图文/步骤指南请参阅 [**Windows 使用说明文档（`docs/WINDOWS_GUIDE.md`）**](docs/WINDOWS_GUIDE.md)。
+
 Windows 下默认只读读取本机官方 `%LOCALAPPDATA%\Programs\Antigravity`（严禁修改官方原版），在同级构建独立客户端 **`%LOCALAPPDATA%\Programs\Hakimi`** 并创建开始菜单/桌面 **`哈基米`** 快捷方式（要求 Node.js `>= 22.4.0`）：
 
 ```powershell
